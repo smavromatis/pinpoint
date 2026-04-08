@@ -32,5 +32,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: build/libs/Pinpoint-*.jar
-          generate_release_notes: true
+          body_path: .github/release_body.md
+          generate_release_notes: false
           token: ${{ secrets.GITHUB_TOKEN }}
