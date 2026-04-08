@@ -1,7 +1,6 @@
 # Gradle
 .gradle/
 build/
-!gradle/wrapper/gradle-wrapper.jar
 
 # Log Files
 *.log
@@ -41,3 +40,6 @@ bin/
 *.war
 *.zip
 *.tar.gz
+
+# Allow Gradle Wrapper JAR
+!gradle/wrapper/gradle-wrapper.jar
