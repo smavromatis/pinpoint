@@ -20,7 +20,7 @@ Pinpoint ports the endpoint-specific breakpoint paradigm of browser developer to
 
 ## Screenshots
 
-![Pinpoint Screenshot](assets/pinpoint.png)
+![Pinpoint Screenshot](assets/pinpoint.PNG)
 
 ## Key Features
 
