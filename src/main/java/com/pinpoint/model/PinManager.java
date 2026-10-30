@@ -614,6 +614,15 @@ public class PinManager {
         if (api != null) api.persistence().preferences().setInteger(KEY_EDITOR_SPLIT, permille);
     }
 
+    /** Small per-user UI settings (stored in Burp's preferences, so they apply across projects). */
+    public String getUiPreference(String key) {
+        return api != null ? api.persistence().preferences().getString("pinpoint.ui." + key) : null;
+    }
+
+    public void setUiPreference(String key, String value) {
+        if (api != null) api.persistence().preferences().setString("pinpoint.ui." + key, value);
+    }
+
     public ViewFilter getViewFilter() {
         return viewFilter;
     }

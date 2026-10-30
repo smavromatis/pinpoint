@@ -22,9 +22,12 @@ import java.util.Set;
  */
 public final class FlowTracker {
 
-    /** An immutable view of one flow for the UI; parentKey is the page an action is nested under, or null. */
+    /**
+     * An immutable view of one flow for the UI; parentKey is the page an action is nested under, or
+     * null; lastStartMillis is when its latest run began (for newest-first ordering).
+     */
     public record FlowView(String key, FlowDetector.Kind kind, String name, int runs, List<TrafficEntry> steps,
-                           String parentKey) {}
+                           String parentKey, long lastStartMillis) {}
 
     private static final int MAX_FLOWS = 50;
     private static final int MAX_STEPS = 40;
@@ -39,6 +42,7 @@ public final class FlowTracker {
         String name;
         String parentKey;
         int runs;
+        long lastStartMillis;
         final List<TrafficEntry> steps = new ArrayList<>();
 
         Flow(String key) {
@@ -83,6 +87,7 @@ public final class FlowTracker {
             flow.kind = start.kind();
             flow.name = start.name();
             flow.runs++;
+            flow.lastStartMillis = request.millis();
             flow.steps.clear();
             current = flow;
             if (isPage(start.kind())) {
@@ -128,7 +133,7 @@ public final class FlowTracker {
     }
 
     private static FlowView view(Flow f, String parentKey) {
-        return new FlowView(f.key, f.kind, f.name, f.runs, List.copyOf(f.steps), parentKey);
+        return new FlowView(f.key, f.kind, f.name, f.runs, List.copyOf(f.steps), parentKey, f.lastStartMillis);
     }
 
     private static boolean isPage(FlowDetector.Kind kind) {

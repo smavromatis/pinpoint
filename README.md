@@ -53,7 +53,7 @@ Requires Java 17+ and Burp Suite Community or Professional (a version with the M
 | **Step Mode** | Pauses every visible request and response. Press Forward to send them one by one. |
 | **⏸ held** | Shows how many messages are paused. Click it to open the paused message. |
 | **Filter** | Shows only cards whose URL (or grep match) contains the text you type. |
-| **Lanes** | Groups cards by flow (what you did), by host, or by host and file type. |
+| **Lanes** | Groups cards by flow (what you did), by host, or by host and file type, and sets the row order: newest first, first seen, or your own. Drag a row's title to move it. |
 | **Focus ▾** | Hides chosen file types. Click the arrow to pick which ones. |
 | **Only In-Scope** | Shows only traffic that is in Burp's scope. |
 | **Clear Graph** | Removes all cards. Breakpoints and grep rules are kept. |

@@ -31,6 +31,7 @@ public class PinsPanel {
     private final InterceptPanel interceptPanel;
     private JButton heldBtn;
     private JButton lanesBtn;
+    private static final String PREF_LANE_ORDER = "laneOrder";
     private boolean flowLanes = true;
 
     private static final String CARD_VIEW = "view";
@@ -226,6 +227,9 @@ public class PinsPanel {
             buildLanesMenu(lanesMenu, pinManager);
             lanesMenu.show(lanesBtn, 0, lanesBtn.getHeight());
         });
+        trafficPlotPanel.setOnLaneOrderChanged(order -> updateLanesLabel());
+        String savedOrder = pinManager.getUiPreference(PREF_LANE_ORDER);
+        if ("FIRST_SEEN".equals(savedOrder)) trafficPlotPanel.setLaneOrder(TrafficPlotPanel.LaneOrder.FIRST_SEEN);
         setLanes(true, false);
 
         graphToolbar.add(interceptBtn);
@@ -354,14 +358,40 @@ public class PinsPanel {
         }
     }
 
-    /** The Lanes dropdown: how the graph's rows are grouped. */
+    /** The Lanes dropdown: how the graph's rows are grouped, and in what order. */
     private void buildLanesMenu(JPopupMenu menu, PinManager pinManager) {
         menu.removeAll();
         boolean byType = pinManager.getViewFilter().groupByType();
+        menu.add(menuHeader("Group"));
         ButtonGroup group = new ButtonGroup();
         addLaneOption(menu, group, "By flow (pages & actions)", flowLanes, () -> setLanes(true, byType));
         addLaneOption(menu, group, "By host", !flowLanes && !byType, () -> setLanes(false, false));
         addLaneOption(menu, group, "By host and file type", !flowLanes && byType, () -> setLanes(false, true));
+
+        menu.addSeparator();
+        menu.add(menuHeader("Order"));
+        ButtonGroup order = new ButtonGroup();
+        TrafficPlotPanel.LaneOrder current = trafficPlotPanel.getLaneOrder();
+        addLaneOption(menu, order, "Newest first", current == TrafficPlotPanel.LaneOrder.NEWEST,
+                () -> setLaneOrder(TrafficPlotPanel.LaneOrder.NEWEST));
+        addLaneOption(menu, order, "First seen", current == TrafficPlotPanel.LaneOrder.FIRST_SEEN,
+                () -> setLaneOrder(TrafficPlotPanel.LaneOrder.FIRST_SEEN));
+        addLaneOption(menu, order, "Custom (drag a row's title to move it)", current == TrafficPlotPanel.LaneOrder.CUSTOM,
+                () -> setLaneOrder(TrafficPlotPanel.LaneOrder.CUSTOM));
+    }
+
+    private static JComponent menuHeader(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(Theme.font(Font.BOLD, -2));
+        label.setForeground(Theme.muted());
+        label.setBorder(BorderFactory.createEmptyBorder(Theme.px(Theme.SPACE_S), Theme.px(Theme.SPACE_M), Theme.px(Theme.SPACE_XS), Theme.px(Theme.SPACE_M)));
+        return label;
+    }
+
+    private void setLaneOrder(TrafficPlotPanel.LaneOrder order) {
+        trafficPlotPanel.setLaneOrder(order);
+        // Newest / first seen are remembered; a custom arrangement only applies to this session's rows
+        if (order != TrafficPlotPanel.LaneOrder.CUSTOM) pinManager.setUiPreference(PREF_LANE_ORDER, order.name());
     }
 
     private static void addLaneOption(JPopupMenu menu, ButtonGroup group, String text, boolean selected, Runnable action) {
@@ -375,7 +405,15 @@ public class PinsPanel {
         flowLanes = byFlow;
         trafficPlotPanel.setGroupByType(byType);
         trafficPlotPanel.setFlowMode(byFlow);
-        lanesBtn.setText("Lanes: " + (byFlow ? "By flow" : byType ? "By host & type" : "By host") + "  \u25BE");
+        updateLanesLabel();
+    }
+
+    /** "Custom" once the user has arranged rows themselves; otherwise how rows are grouped. */
+    private void updateLanesLabel() {
+        boolean byType = pinManager.getViewFilter().groupByType();
+        String text = trafficPlotPanel.getLaneOrder() == TrafficPlotPanel.LaneOrder.CUSTOM ? "Custom"
+                : flowLanes ? "By flow" : byType ? "By host & type" : "By host";
+        lanesBtn.setText("Lanes: " + text + "  \u25BE");
     }
 
     private static final Map<String, String> TYPE_LABELS = Map.of("Endpoints", "Endpoints (pages & APIs)");
@@ -433,6 +471,8 @@ public class PinsPanel {
     private void setHeldCount(int count) {
         heldBtn.setText("\u23F8 " + count + " held");
         heldBtn.setVisible(count > 0);
+        // Rows don't reorder while a held message is waiting to be edited
+        trafficPlotPanel.setOrderFrozen(count > 0);
     }
 
     private TrafficEntry selectedNode() {

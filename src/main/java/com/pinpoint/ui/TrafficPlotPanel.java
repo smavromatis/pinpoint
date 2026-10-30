@@ -53,6 +53,31 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
     private static final String FLOW_LANE_PREFIX = "flow:";
     private static final String OTHER_FLOW_LANE = FLOW_LANE_PREFIX + "\u0000other";
     private record FlowLane(String title, String subtitle, boolean inScope) {}
+
+    /** Order of the rows: most recent run first, order first seen, or the user's own (by dragging). */
+    public enum LaneOrder { NEWEST, FIRST_SEEN, CUSTOM }
+    private LaneOrder laneOrder = LaneOrder.NEWEST;
+    private Consumer<LaneOrder> onLaneOrderChanged;
+    // The user's arrangement (lane keys); only the relative order of siblings matters
+    private final List<String> customOrder = new ArrayList<>();
+    // While the user works in the graph (pointer over it, a message held, a drag), rows don't move:
+    // the last top-level order is kept and new rows are added at the bottom
+    private List<String> lastTopOrder = new ArrayList<>();
+    private List<String> displayOrder = new ArrayList<>();
+    private boolean pointerInside;
+    private boolean orderFrozen;
+    private boolean forceReorder;
+    // When each lane last started a run (flows) or was hit (hosts), and every lane's cards,
+    // including lanes hidden inside a collapsed page (for the collapsed-activity hint)
+    private final Map<String, Long> laneRecency = new HashMap<>();
+    private final Map<String, List<Integer>> laneEntries = new HashMap<>();
+    // Dragging a lane's title bar to reorder it among its siblings
+    private String pressedLane;
+    private Point pressPoint;
+    private boolean draggingLane;
+    private int dragY;
+    private String dropBefore;     // sibling the dragged lane goes in front of; null = after the last one
+    private int dropLineY = -1;
     private boolean flowMode = false;
     private final List<FlowTracker.FlowView> flows = new ArrayList<>();
     private final Map<String, FlowLane> flowLanes = new HashMap<>();
@@ -89,7 +114,9 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
                     setToolTipText(dotEntry.isBreakpoint() ? "Remove breakpoint" : "Set breakpoint");
                 } else if (flowLaneAt(e.getPoint()) != null) {
                     FlowLane lane = flowLanes.get(flowLaneAt(e.getPoint()));
-                    setToolTipText(lane.title() + "  \u2014  " + lane.subtitle());
+                    setToolTipText(lane.title() + "  \u2014  " + lane.subtitle() + "   (click to collapse, drag to reorder)");
+                } else if (laneTitleAt(e.getPoint()) != null) {
+                    setToolTipText("Click to collapse, drag to reorder, right-click for scope options");
                 } else if (entry != hoveredEntry || entry == null || hoveredDotEntry != null) {
                     setToolTipText(entry != null ? entry.getHost() + entry.getPath() : null);
                 }
@@ -101,14 +128,44 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
             }
 
             @Override
+            public void mouseEntered(MouseEvent e) {
+                pointerInside = true;
+            }
+
+            @Override
             public void mouseExited(MouseEvent e) {
                 hoveredEntry = null;
                 hoveredDotEntry = null;
+                pointerInside = false;
+                // Apply any reordering held back while the pointer was over the graph
+                relayout();
+            }
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                String lane = SwingUtilities.isLeftMouseButton(e) ? laneTitleAt(e.getPoint()) : null;
+                pressedLane = lane != null && !lane.equals(OTHER_FLOW_LANE) && getScopeButtonAt(e.getPoint()) == null ? lane : null;
+                pressPoint = e.getPoint();
+            }
+
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                if (pressedLane == null) return;
+                if (!draggingLane && pressPoint.distance(e.getPoint()) < Theme.px(6)) return;
+                draggingLane = true;
+                setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
+                dragY = e.getY();
+                updateDropTarget();
                 repaint();
             }
 
             @Override
             public void mouseReleased(MouseEvent e) {
+                if (draggingLane) {
+                    finishLaneDrag();
+                    return;
+                }
+                pressedLane = null;
                 // Breakpoint dot: toggles without selecting the node or opening the editor
                 TrafficEntry dotEntry = getBreakpointDotAt(e.getPoint());
                 if (SwingUtilities.isLeftMouseButton(e) && dotEntry != null) {
@@ -492,7 +549,18 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
         cardLaneKeys.clear();
         cardLabels.clear();
 
-        LinkedHashMap<String, List<Integer>> hostGroups = flowMode ? groupByFlow() : groupByHost();
+        laneRecency.clear();
+        LinkedHashMap<String, List<Integer>> grouped = flowMode ? groupByFlow() : groupByHost();
+        laneEntries.clear();
+        laneEntries.putAll(grouped);
+        if (!flowMode) {
+            for (Map.Entry<String, List<Integer>> g : grouped.entrySet()) {
+                long latest = 0;
+                for (int idx : g.getValue()) latest = Math.max(latest, log.get(idx).getLastActivityMillis());
+                laneRecency.put(g.getKey(), latest);
+            }
+        }
+        LinkedHashMap<String, List<Integer>> hostGroups = orderLanes(grouped);
 
         int availableWidth = getWidth();
         if (getParent() instanceof JViewport) {
@@ -551,6 +619,182 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
         }
 
         setPreferredSize(new Dimension(maxX, Math.max(y + pad, 120)));
+    }
+
+    /**
+     * Puts lanes in display order: top-level lanes by the chosen order, each followed by its
+     * nested actions; "Other traffic" last. While frozen, rows keep their places and new ones
+     * go at the bottom, so nothing moves under the user's pointer.
+     */
+    private LinkedHashMap<String, List<Integer>> orderLanes(LinkedHashMap<String, List<Integer>> grouped) {
+        List<String> tops = new ArrayList<>();
+        Map<String, List<String>> children = new HashMap<>();
+        for (String key : grouped.keySet()) {
+            String parent = laneParent.get(key);
+            if (parent != null && grouped.containsKey(parent)) children.computeIfAbsent(parent, k -> new ArrayList<>()).add(key);
+            else if (!key.equals(OTHER_FLOW_LANE)) tops.add(key);
+        }
+
+        List<String> orderedTops;
+        boolean frozen = !forceReorder && (pointerInside || orderFrozen || draggingLane);
+        if (frozen && !lastTopOrder.isEmpty()) {
+            orderedTops = new ArrayList<>();
+            for (String key : lastTopOrder) if (tops.contains(key)) orderedTops.add(key);
+            for (String key : tops) if (!orderedTops.contains(key)) orderedTops.add(key);
+        } else {
+            orderedTops = sorted(tops);
+        }
+        lastTopOrder = new ArrayList<>(orderedTops);
+        forceReorder = false;
+
+        LinkedHashMap<String, List<Integer>> ordered = new LinkedHashMap<>();
+        for (String top : orderedTops) {
+            ordered.put(top, grouped.get(top));
+            List<String> kids = children.getOrDefault(top, List.of());
+            // Actions keep their order within a page, unless the user arranged them
+            for (String kid : laneOrder == LaneOrder.CUSTOM ? sorted(kids) : kids) ordered.put(kid, grouped.get(kid));
+        }
+        if (grouped.containsKey(OTHER_FLOW_LANE)) ordered.put(OTHER_FLOW_LANE, grouped.get(OTHER_FLOW_LANE));
+        displayOrder = new ArrayList<>(ordered.keySet());
+        return ordered;
+    }
+
+    private List<String> sorted(List<String> keys) {
+        List<String> result = new ArrayList<>(keys);
+        Comparator<String> newest = Comparator.comparingLong((String k) -> laneRecency.getOrDefault(k, 0L)).reversed();
+        switch (laneOrder) {
+            case NEWEST -> result.sort(newest);
+            case FIRST_SEEN -> { }
+            case CUSTOM -> {
+                // Rows the user hasn't placed yet (new ones) go first, newest first; the rest keep the user's order
+                List<String> unplaced = new ArrayList<>(), placed = new ArrayList<>();
+                for (String k : result) (customOrder.contains(k) ? placed : unplaced).add(k);
+                unplaced.sort(newest);
+                placed.sort(Comparator.comparingInt(customOrder::indexOf));
+                result.clear();
+                result.addAll(unplaced);
+                result.addAll(placed);
+            }
+        }
+        return result;
+    }
+
+    public void setOnLaneOrderChanged(Consumer<LaneOrder> handler) {
+        this.onLaneOrderChanged = handler;
+    }
+
+    public LaneOrder getLaneOrder() {
+        return laneOrder;
+    }
+
+    /** Chosen in the Lanes menu: applies right away, even with the pointer over the graph. */
+    public void setLaneOrder(LaneOrder order) {
+        if (order == LaneOrder.CUSTOM && customOrder.isEmpty()) customOrder.addAll(displayOrder);
+        laneOrder = order;
+        forceReorder = true;
+        relayout();
+        if (onLaneOrderChanged != null) onLaneOrderChanged.accept(order);
+    }
+
+    /** While something is held for editing, rows stay put; the order catches up afterwards. */
+    public void setOrderFrozen(boolean frozen) {
+        if (orderFrozen == frozen) return;
+        orderFrozen = frozen;
+        if (!frozen) relayout();
+    }
+
+    private void relayout() {
+        layoutCards();
+        revalidate();
+        repaint();
+    }
+
+    /** Siblings of a lane in display order: other top-level lanes, or the actions of the same page. */
+    private List<String> siblingsOf(String lane) {
+        String parent = laneParent.get(lane);
+        List<String> siblings = new ArrayList<>();
+        for (String key : displayOrder) {
+            if (key.equals(OTHER_FLOW_LANE)) continue;
+            if (Objects.equals(laneParent.get(key), parent)) siblings.add(key);
+        }
+        return siblings;
+    }
+
+    /** Vertical extent of a lane on screen, including the actions nested under a page. */
+    private int[] laneBlock(String lane) {
+        Rectangle r = laneRects.get(lane);
+        if (r == null) return null;
+        int top = r.y, bottom = r.y + r.height;
+        for (Map.Entry<String, String> child : laneParent.entrySet()) {
+            Rectangle cr = child.getValue().equals(lane) ? laneRects.get(child.getKey()) : null;
+            if (cr != null) bottom = Math.max(bottom, cr.y + cr.height);
+        }
+        return new int[]{top, bottom};
+    }
+
+    private void updateDropTarget() {
+        dropBefore = null;
+        dropLineY = -1;
+        int lastBottom = -1;
+        for (String sibling : siblingsOf(pressedLane)) {
+            int[] block = laneBlock(sibling);
+            if (block == null) continue;
+            if (dropBefore == null && dragY < (block[0] + block[1]) / 2) {
+                dropBefore = sibling;
+                dropLineY = block[0];
+            }
+            lastBottom = Math.max(lastBottom, block[1]);
+        }
+        if (dropBefore == null) dropLineY = lastBottom;
+    }
+
+    /** Dropping a dragged lane switches the order to Custom, starting from what's on screen. */
+    private void finishLaneDrag() {
+        String moved = pressedLane;
+        String before = dropBefore;
+        pressedLane = null;
+        draggingLane = false;
+        dropLineY = -1;
+        setCursor(Cursor.getDefaultCursor());
+        if (moved == null || moved.equals(before)) {
+            repaint();
+            return;
+        }
+        List<String> siblings = siblingsOf(moved);
+        customOrder.clear();
+        customOrder.addAll(displayOrder);
+        customOrder.remove(moved);
+        int index = before != null ? customOrder.indexOf(before)
+                : customOrder.indexOf(siblings.get(siblings.size() - 1)) + 1;
+        customOrder.add(Math.max(0, Math.min(index, customOrder.size())), moved);
+        laneOrder = LaneOrder.CUSTOM;
+        forceReorder = true;
+        relayout();
+        if (onLaneOrderChanged != null) onLaneOrderChanged.accept(laneOrder);
+    }
+
+    /** What's happening inside a collapsed lane (and the actions hidden with it). */
+    private record HiddenActivity(float glow, Color color, boolean held) {}
+
+    private HiddenActivity hiddenActivity(String lane, long now) {
+        List<Integer> indices = new ArrayList<>(laneEntries.getOrDefault(lane, List.of()));
+        for (Map.Entry<String, String> child : laneParent.entrySet()) {
+            if (child.getValue().equals(lane)) indices.addAll(laneEntries.getOrDefault(child.getKey(), List.of()));
+        }
+        float glow = 0;
+        Color color = null;
+        boolean held = false;
+        for (int idx : indices) {
+            if (idx >= log.size()) continue;
+            TrafficEntry e = log.get(idx);
+            held |= e.isPaused();
+            float g = glowStrength(e.getLastActivityMillis(), now);
+            if (g > glow) {
+                glow = g;
+                color = activityColor(e);
+            }
+        }
+        return new HiddenActivity(glow, color, held);
     }
 
     private LinkedHashMap<String, List<Integer>> groupByHost() {
@@ -633,6 +877,8 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
             int actions = actionCounts.getOrDefault(flow.key(), 0);
             String nested = actions == 0 ? "" : " \u00B7 " + actions + (actions == 1 ? " action" : " actions");
             flowLanes.put(laneKey, new FlowLane(flow.name(), runs + flow.kind().label + nested, inScope));
+            laneRecency.merge(laneKey, flow.lastStartMillis(), Math::max);
+            if (laneParent.containsKey(laneKey)) laneRecency.merge(laneParent.get(laneKey), flow.lastStartMillis(), Math::max);
         }
 
         List<Integer> other = new ArrayList<>();
@@ -702,6 +948,9 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
                 String pillLane = !inScope && host.length() > 1 ? groupKey : null;
                 drawLaneTitle(g2, groupKey, laneEntry.getValue(), fullW, host, type, inScope, pillLane);
             }
+            if (filter.collapsedLanes().contains(groupKey)) {
+                drawHiddenActivity(g2, laneEntry.getValue(), fullW, hiddenActivity(groupKey, System.currentTimeMillis()));
+            }
             laneIdx++;
         }
 
@@ -734,6 +983,7 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
 
         // Live trail on top so it stays visible across lanes; flow lanes already show the order
         if (!flowMode) drawTrail(g2, now);
+        if (draggingLane) drawDragFeedback(g2, fullW);
 
         if (flowMode && laneHeaderRects.isEmpty()) {
             drawCenteredMessage(g2, "No flows yet. Load or refresh a page, or use the app, to see its flows.");
@@ -752,6 +1002,49 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
         }
         return labelCache.computeIfAbsent(maxWidth + "|" + path,
                 k -> com.pinpoint.utils.TrafficUtils.endpointLabel(path, fm::stringWidth, maxWidth));
+    }
+
+    /**
+     * Subtle hint that something inside a collapsed lane is active: a coloured strip and tint that
+     * fade like the card glow; a pulsing orange strip and "held" label when a message is waiting.
+     */
+    private void drawHiddenActivity(Graphics2D g2, Rectangle bar, int fullW, HiddenActivity activity) {
+        if (!activity.held() && activity.glow() <= 0) return;
+        Color color = activity.held() ? Theme.accent() : activity.color();
+        float strength = activity.held() ? 0.55f + 0.45f * (float) Math.sin(System.currentTimeMillis() / 200.0) : activity.glow();
+        g2.setColor(Theme.withAlpha(color, (int) (strength * 40)));
+        g2.fillRect(bar.x, bar.y, fullW - bar.x, bar.height);
+        g2.setColor(Theme.withAlpha(color, (int) (strength * 230)));
+        g2.fillRect(bar.x, bar.y, Theme.px(4), bar.height);
+        if (activity.held()) {
+            String label = "\u23F8 held";
+            g2.setFont(Theme.font(Font.BOLD, -3));
+            FontMetrics fm = g2.getFontMetrics();
+            int x = bar.x + bar.width - fm.stringWidth(label) - Theme.px(Theme.SPACE_L);
+            g2.setColor(Theme.accent());
+            g2.drawString(label, x, bar.y + (bar.height + fm.getAscent() - fm.getDescent()) / 2);
+        }
+    }
+
+    /** While dragging a lane: an insertion line where it will land, and its title following the pointer. */
+    private void drawDragFeedback(Graphics2D g2, int fullW) {
+        Rectangle bar = laneHeaderRects.get(pressedLane);
+        if (bar == null) return;
+        if (dropLineY >= 0) {
+            g2.setColor(Theme.accent());
+            g2.fillRect(bar.x, dropLineY - 1, fullW - bar.x, Theme.px(3));
+        }
+        int y = dragY - bar.height / 2;
+        g2.setColor(Theme.withAlpha(Theme.surface(), 220));
+        g2.fillRect(bar.x, y, fullW - bar.x, bar.height);
+        g2.setColor(Theme.accent());
+        g2.drawRect(bar.x, y, fullW - bar.x - 1, bar.height - 1);
+        FlowLane lane = flowLanes.get(pressedLane);
+        String title = lane != null ? lane.title() : hostOfLane(pressedLane);
+        g2.setFont(Theme.font(Font.BOLD, -1));
+        FontMetrics fm = g2.getFontMetrics();
+        g2.setColor(Theme.foreground());
+        g2.drawString(title, bar.x + Theme.px(Theme.SPACE_L), y + (bar.height + fm.getAscent() - fm.getDescent()) / 2);
     }
 
     private void drawCenteredMessage(Graphics2D g2, String message) {
