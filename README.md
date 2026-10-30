@@ -12,74 +12,65 @@
 ![Build](https://img.shields.io/badge/Build-Gradle-brightgreen.svg)
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
-**Pinpoint** is a Burp Suite extension designed to streamline the targeting and manipulation of multi-step logic flaws.
+**Pinpoint** is a Burp Suite extension that shows your traffic as a map and lets you pause only the requests you choose, like breakpoints in browser DevTools.
 
-Setting breakpoints in Chrome Developer Tools provides a highly targeted debugging workflow. Replicating this natively in Burp Suite requires manually configuring regular expression matching rules or relying on the global Proxy Intercept, which can arbitrarily pause background traffic and disrupt the application state.
-
-Pinpoint ports the endpoint-specific breakpoint paradigm of browser developer tools into Burp Suite. It replaces the flat HTTP history table with an interactive visual node graph, allowing users to intercept specific requests and responses independent of Burp's global proxy configuration.
-
-## Screenshots
+Burp's normal intercept stops everything. Pinpoint stops only the endpoints you mark, and lets the rest of the traffic through.
 
 ![Pinpoint Screenshot](assets/pinpoint.PNG)
 
-## Key Features
+## Features
 
-* **Visual Traffic Graph**  
-  Replaces the traditional HTTP history table with an interactive, node-based map of your live traffic.
+* **Traffic map**: every endpoint you visit appears as a card. Cards are grouped by what you did (loading a page, clicking a tab, searching), in the order the calls happened.
+* **Breakpoints**: click the dot on a card to pause that endpoint. You can also add rules that match part of a URL, an exact URL, or a regex.
+* **Edit and forward**: when a request or response is paused, edit it below the map and click Forward or Drop.
+* **Step Mode**: pause every request and response, then send them one at a time to see exactly what the app does.
+* **Live Grep**: highlight responses that contain some text or match a regex, in headers or body.
+* **Focus**: hide files you don't care about (JS, CSS, images, fonts by default). You choose which types to hide.
+* **Scope**: add a host to Burp's scope from the map in one click.
 
-* **Point-and-Click Breakpoints**  
-  Click the breakpoint dot on any node in the graph to set or remove a breakpoint, like in browser DevTools. For broader rules, open **Breakpoints & Grep** and add a *Contains*, *Exact* or *Regex* breakpoint (e.g. `/api/users/\d+/orders`), choosing whether it holds the request, the response or both. Every rule shows how many nodes it matches, and can be edited in place.
+## Install
 
-* **Live Grep**  
-  Flag responses whose headers or body contain some text or match a regex. Matching nodes get a badge in the graph, and each rule shows how many it has flagged.
+1. Download the latest `.jar` from [Releases](https://github.com/smavromatis/pinpoint/releases).
+2. In Burp Suite, go to `Extensions` > `Installed` > `Add`.
+3. Select the `.jar` file. If an older version is loaded, remove it first.
 
-* **Isolated, In-Graph Interception**  
-  Only your targeted endpoints pause. Background traffic automatically flows through without hanging your browser, and paused nodes pulse right in the graph.
+Requires Java 17+ and Burp Suite Community or Professional (a version with the Montoya API).
 
-* **Live Flow & Step Mode**  
-  Nodes light up as the app moves from step to step, with a trail showing the order. Step Mode holds every visible request and response so you can walk through a flow one message at a time with Forward (F10), like stepping in a debugger.
+## Quick start
 
-* **Automatic Flows**  
-  The graph shows one row per user action by default (**Flows**; switch it off for one row per host) (page loads, reloads, form submits, route changes, clicks and searches), with each row's steps numbered in call order. Flows are detected from browser and framework signals (Fetch Metadata headers, Next.js, Remix, Inertia, htmx, Turbo, GraphQL operations, Sentry traces) and named automatically; background polling is ignored.
+1. Add your target to Burp's scope.
+2. Open the **Pinpoint** tab and use the target in your browser. Cards appear as requests are made.
+3. Click a card to see its latest request and response.
+4. Click the small circle in a card's top-right corner to set a breakpoint. It turns orange.
+5. Repeat the action in the browser. The request pauses and appears under the map.
+6. Edit it, then click **Forward** (or press **F10**) or **Drop**.
 
-* **Focus Mode**  
-  Hides static assets (JS, CSS, images, fonts) by default so the graph and Step Mode only show the application's logic. Click the **▾** on the Focus button to choose exactly which file types are shown; the choice is remembered.
+## Toolbar
 
-* **Automatic Response Pairing**  
-  When you forward a paused request, the extension automatically catches and displays the exact matching HTTP response.
+| Control | What it does |
+|---|---|
+| **Intercept on / off** | Turns breakpoints on or off. |
+| **Step Mode** | Pauses every visible request and response. Press Forward to send them one by one. |
+| **⏸ held** | Shows how many messages are paused. Click it to open the paused message. |
+| **Filter** | Shows only cards whose URL (or grep match) contains the text you type. |
+| **Lanes** | Groups cards by flow (what you did), by host, or by host and file type. |
+| **Focus ▾** | Hides chosen file types. Click the arrow to pick which ones. |
+| **Only In-Scope** | Shows only traffic that is in Burp's scope. |
+| **Clear Graph** | Removes all cards. Breakpoints and grep rules are kept. |
+| **Breakpoints & Grep** | Opens the side panel to add, edit or remove breakpoints and grep rules. |
 
-* **Native Embedded Editors**  
-  Modify headers and bodies directly within the extension using Burp's built-in message editors.
+Hover **Legend** in the bottom-right corner of the map to see what the colours and outlines mean.
 
-## Requirements
+## Build from source
 
-* **Java 17+** 
-* **Burp Suite Professional or Community** (Must support the newer Montoya API)
+```
+./gradlew build
+```
 
-## Installation
-
-The easiest way to get it running is to grab the pre-compiled JAR file from the **[Releases](https://github.com/smavromatis/pinpoint/releases)** tab.
-
-1. Download the latest .jar file from the **[Releases](https://github.com/smavromatis/pinpoint/releases)** tab.
-2. Open Burp Suite.
-3. Head to `Extensions` -> `Installed` -> `Add`.
-4. Select the JAR file and you're good to go!
-
-If you want to build it yourself, just clone the repo and run `./gradlew build` (or open it in IntelliJ/Eclipse). It'll spit out the JAR in the `build/libs/` folder.
-
-## How to use it
-
-1. **Define your Scope:** First, ensure your target application is properly added to Burp Suite's Target Scope. Pinpoint respects your scope rules, so a clean scope ensures your visual graph isn't cluttered with background noise!
-2. Open the **Pinpoint** tab in Burp Suite. As you browse your target application, watch your live traffic map out into a visual node graph. Click a node to view its latest request and response (read-only) below the graph.
-3. Found an endpoint you want to manipulate? Hover its node and click the small **○** in its top-right corner (or double-click the node). The dot turns solid orange to show a breakpoint is set, and **Intercept** switches on. Click the dot again to remove it.
-4. Trigger the request again in your browser. The node pulses orange and the area below the graph becomes editable: the held side is marked **✎ editable**, the other side is shown read-only for context.
-5. Modify the request or response, then click **Forward** or press **F10** (or **Drop**). If several messages are held, use **◀ ▶** to move between them; unsent edits are kept when you switch. Click any paused node, or the **⏸ held** button in the toolbar, to jump to a held message.
-6. To walk through a whole flow, turn on **Step Mode** and press **Forward** (or **F10**) to release one message at a time. Anything hidden from the graph (by **Focus**, **Only In-Scope**, the filter, or a collapsed lane) is skipped.
+The `.jar` is created in `build/libs/`.
 
 ## License
 
-This project is licensed under the [GNU General Public License v3 (GPL-3.0)](LICENSE). 
+[GNU General Public License v3 (GPL-3.0)](LICENSE). Copyright (c) 2026 Stylianos Mavromatis.
 
-Copyright (c) 2026 Stylianos Mavromatis.
-
-Happy bug hunting! If you encounter any issues with the tool or can think of any improvements, please feel free to let me know!
+Found a bug or have an idea? Please open an issue.
