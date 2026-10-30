@@ -4,6 +4,7 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import com.pinpoint.model.PinManager;
+import com.pinpoint.utils.TrafficUtils;
 
 import javax.swing.*;
 import java.awt.*;
@@ -40,15 +41,11 @@ public class PinContextMenuProvider implements ContextMenuItemsProvider {
 
         JMenuItem pinItem = new JMenuItem("Send to Pinpoint");
         pinItem.addActionListener(l -> {
-            String url = finalReqRes.request().url();
-
-            int fragmentIndex = url.indexOf('#');
-            if (fragmentIndex > 0) url = url.substring(0, fragmentIndex);
-
-            int queryIndex = url.indexOf('?');
-            if (queryIndex > 0) url = url.substring(0, queryIndex);
-            pinManager.addPin(url);
-            api.logging().logToOutput("Pinpoint breakpoint set: " + url);
+            // Same rule as clicking a node's breakpoint dot: exact host + path
+            String[] hostPath = TrafficUtils.parseHostAndPath(finalReqRes.request().url());
+            String pattern = hostPath[0] + hostPath[1];
+            String error = pinManager.addPin(pattern, PinManager.MatchType.EXACT, true, true);
+            api.logging().logToOutput(error == null ? "Pinpoint breakpoint set: " + pattern : "Pinpoint: " + error + " (" + pattern + ")");
         });
         menuItems.add(pinItem);
 

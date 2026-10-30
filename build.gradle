@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.pinpoint'
-version = '1.0.0'
+version = '2.0.0'
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -12,6 +12,8 @@ java {
 
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
+    // Compile against the Java 17 API (as CI and Burp's minimum do), even when building on a newer JDK
+    options.release = 17
 }
 
 repositories {
@@ -19,7 +21,9 @@ repositories {
 }
 
 dependencies {
-    implementation 'net.portswigger.burp.extensions:montoya-api:2026.2'
+    // Provided by Burp at runtime: compile against it, but don't bundle it into the jar
+    compileOnly 'net.portswigger.burp.extensions:montoya-api:2026.2'
+    testImplementation 'net.portswigger.burp.extensions:montoya-api:2026.2'
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.1'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.1'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.1'
@@ -30,6 +34,9 @@ test {
 }
 
 jar {
+    manifest {
+        attributes 'Implementation-Title': 'Pinpoint', 'Implementation-Version': project.version
+    }
     from {
         configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
     }

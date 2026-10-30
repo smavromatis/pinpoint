@@ -1,292 +1,144 @@
 package com.pinpoint.ui;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
+import com.pinpoint.model.PendingItem;
 import com.pinpoint.model.PinManager;
 import com.pinpoint.model.TrafficEntry;
+import com.pinpoint.model.ViewFilter;
 
 import javax.swing.*;
-import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class PinsPanel {
 
     private final JPanel mainPanel;
-    private final DefaultTableModel tableModel;
-    private final JTable table;
-    private final DefaultTableModel keywordModel;
-    private final JTable kwTable;
+    private final RulesSidebar rulesSidebar;
+    private final PinManager pinManager;
     private final TrafficPlotPanel trafficPlotPanel;
-    private TrafficEntry selectedTraffic = null;
-    private final List<PinRuleId> sortedRowIdentities = new ArrayList<>();
 
-    private static class PinRuleId {
-        final String pattern;
-        final boolean isExact;
-        PinRuleId(String pattern, boolean isExact) {
-            this.pattern = pattern;
-            this.isExact = isExact;
-        }
-    }
+    private static final int TRAFFIC_REFRESH_MS = 200;
 
-    public PinsPanel(MontoyaApi api, PinManager pinManager) {
+    private final InterceptPanel interceptPanel;
+    private JButton heldBtn;
+    private JButton lanesBtn;
+    private boolean flowLanes = true;
+
+    private static final String CARD_VIEW = "view";
+    private static final String CARD_HELD = "held";
+    private final CardLayout detailCards = new CardLayout();
+    private final JPanel detailsPanel;
+    private final JSplitPane graphDetailSplit;
+    private final HttpRequestEditor viewReqEditor;
+    private final HttpResponseEditor viewResEditor;
+    private boolean showingHeld = false;
+    private int lastDividerLocation = -1;
+
+    private static final int SIDEBAR_DEFAULT_WIDTH = 440;
+    private JPanel sidebarPanel;
+    private JSplitPane mainSplitPane;
+    private JToggleButton sidebarBtn;
+    private int lastSidebarDividerLocation = -1;
+    private final Timer trafficRefreshTimer;
+    private final AtomicBoolean trafficRefreshPending = new AtomicBoolean(false);
+    private long lastTrafficRefreshNanos = System.nanoTime() - TRAFFIC_REFRESH_MS * 1_000_000L; // EDT only
+
+
+    public PinsPanel(MontoyaApi api, PinManager pinManager, InterceptPanel interceptPanel) {
+        this.pinManager = pinManager;
+        this.interceptPanel = interceptPanel;
         this.mainPanel = new JPanel(new BorderLayout());
 
-        JPanel pinsTopPanel = new JPanel(new BorderLayout());
+        // Right-hand sidebar: breakpoints above live grep, collapsed by default so the graph leads
+        rulesSidebar = new RulesSidebar(pinManager, this::selectedNode);
+        sidebarPanel = new JPanel(new BorderLayout());
+        sidebarPanel.add(rulesSidebar.getComponent(), BorderLayout.CENTER);
+        sidebarPanel.setPreferredSize(new Dimension(SIDEBAR_DEFAULT_WIDTH, 0));
+        sidebarPanel.setMinimumSize(new Dimension(220, 0));
+        sidebarPanel.setVisible(false);
 
-        this.tableModel = new DefaultTableModel(new String[]{"Active", "Intercept", "Pattern"}, 0) {
-            @Override
-            public Class<?> getColumnClass(int columnIndex) {
-                if (columnIndex == 0) return Boolean.class;
-                if (columnIndex == 1) return String.class;
-                return String.class;
-            }
-            @Override
-            public boolean isCellEditable(int row, int column) {
-                return column == 0 || column == 1;
-            }
-        };
-
-        this.table = new JTable(tableModel);
-        table.getColumnModel().getColumn(0).setMaxWidth(50);
-        table.getColumnModel().getColumn(0).setMinWidth(50);
-        table.getColumnModel().getColumn(1).setMaxWidth(120);
-        table.getColumnModel().getColumn(1).setMinWidth(100);
-
-        JComboBox<String> interceptCombo = new JComboBox<>(new String[]{
-            PinManager.INTERCEPT_REQ_RES, PinManager.INTERCEPT_REQ_ONLY, PinManager.INTERCEPT_RES_ONLY
-        });
-        table.getColumnModel().getColumn(1).setCellEditor(new DefaultCellEditor(interceptCombo));
-        
-
-        javax.swing.table.DefaultTableCellRenderer centerRenderer = new javax.swing.table.DefaultTableCellRenderer();
-        centerRenderer.setHorizontalAlignment(JLabel.CENTER);
-        table.getColumnModel().getColumn(1).setCellRenderer(centerRenderer);
-
-        tableModel.addTableModelListener(e -> {
-            int row = e.getFirstRow();
-            int column = e.getColumn();
-            if (row >= 0 && row < sortedRowIdentities.size()) {
-                PinRuleId id = sortedRowIdentities.get(row);
-                int origIndex = findPinIndex(pinManager, id);
-                if (origIndex >= 0) {
-                    if (column == 0) {
-                        pinManager.setPinEnabled(origIndex, (Boolean) tableModel.getValueAt(row, 0));
-                    } else if (column == 1) {
-                        String val = (String) tableModel.getValueAt(row, 1);
-                        pinManager.setInterceptRequest(origIndex, val.contains("Req"));
-                        pinManager.setInterceptResponse(origIndex, val.contains("Res"));
-                    }
-                }
-            }
-        });
-
-        JPanel toolbarPanel = new JPanel();
-        toolbarPanel.setLayout(new BoxLayout(toolbarPanel, BoxLayout.X_AXIS));
-        toolbarPanel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, UIManager.getColor("Separator.foreground")),
-                BorderFactory.createEmptyBorder(4, 6, 4, 6)
-        ));
-
-        JLabel titleLabel = new JLabel("Breakpoints");
-        titleLabel.setFont(titleLabel.getFont().deriveFont(Font.BOLD));
-
-        JButton addButton = new JButton("Add");
-        addButton.addActionListener(e -> {
-            String pattern = JOptionPane.showInputDialog(mainPanel, "Enter URL pattern to intercept:\n(e.g. example.com/api/login)");
-            if (pattern != null && !pattern.trim().isEmpty()) {
-                pinManager.addPin(pattern.trim());
-            }
-        });
-
-        JButton removeButton = new JButton("Remove");
-        removeButton.addActionListener(e -> {
-            int[] rows = table.getSelectedRows();
-            List<PinRuleId> toRemove = new ArrayList<>();
-            for (int r : rows) {
-                if (r < sortedRowIdentities.size()) {
-                    toRemove.add(sortedRowIdentities.get(r));
-                }
-            }
-
-            for (PinRuleId id : toRemove) {
-                int idx = findPinIndex(pinManager, id);
-                if (idx >= 0) {
-                    pinManager.removePin(idx);
-                }
-            }
-        });
-
-        toolbarPanel.add(titleLabel);
-        toolbarPanel.add(Box.createHorizontalGlue());
-        toolbarPanel.add(addButton);
-        toolbarPanel.add(Box.createHorizontalStrut(4));
-        toolbarPanel.add(removeButton);
-
-        pinsTopPanel.add(toolbarPanel, BorderLayout.NORTH);
-        pinsTopPanel.add(new JScrollPane(table), BorderLayout.CENTER);
-
-        JPanel keywordsTopPanel = new JPanel(new BorderLayout());
-        
-        this.keywordModel = new DefaultTableModel(new String[]{"Active", "Regex", "Keyword"}, 0) {
-            @Override
-            public Class<?> getColumnClass(int columnIndex) {
-                return columnIndex == 0 || columnIndex == 1 ? Boolean.class : String.class;
-            }
-            @Override
-            public boolean isCellEditable(int row, int column) {
-                return column == 0 || column == 1;
-            }
-        };
-        this.kwTable = new JTable(keywordModel);
-        kwTable.getColumnModel().getColumn(0).setMaxWidth(50);
-        kwTable.getColumnModel().getColumn(0).setMinWidth(50);
-        kwTable.getColumnModel().getColumn(1).setMaxWidth(50);
-        kwTable.getColumnModel().getColumn(1).setMinWidth(50);
-
-        keywordModel.addTableModelListener(e -> {
-            int row = e.getFirstRow();
-            int column = e.getColumn();
-            if (row >= 0 && row < pinManager.getKeywordRules().size()) {
-                if (column == 0) {
-                    pinManager.setKeywordEnabled(row, (Boolean) keywordModel.getValueAt(row, 0));
-                } else if (column == 1) {
-                    pinManager.setKeywordRegex(row, (Boolean) keywordModel.getValueAt(row, 1));
-                }
-            }
-        });
-
-        JPanel kwToolbarPanel = new JPanel();
-        kwToolbarPanel.setLayout(new BoxLayout(kwToolbarPanel, BoxLayout.X_AXIS));
-        kwToolbarPanel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, UIManager.getColor("Separator.foreground")),
-                BorderFactory.createEmptyBorder(4, 6, 4, 6)
-        ));
-
-        JLabel kwTitleLabel = new JLabel("Live Grep");
-        kwTitleLabel.setFont(kwTitleLabel.getFont().deriveFont(Font.BOLD));
-
-        JButton addKwBtn = new JButton("Add");
-        addKwBtn.addActionListener(e -> {
-            String kw = JOptionPane.showInputDialog(mainPanel, "Enter keyword (or pattern) to flag in responses:");
-            if (kw != null && !kw.trim().isEmpty()) {
-                int resp = JOptionPane.showConfirmDialog(mainPanel, "Use Regular Expression matching?", "Regex", JOptionPane.YES_NO_OPTION);
-                pinManager.addKeyword(kw.trim(), resp == JOptionPane.YES_OPTION);
-            }
-        });
-
-        JButton remKwBtn = new JButton("Remove");
-        remKwBtn.addActionListener(e -> {
-            int[] rows = kwTable.getSelectedRows();
-            for (int i = rows.length - 1; i >= 0; i--) {
-                pinManager.removeKeyword(rows[i]);
-            }
-        });
-
-        kwToolbarPanel.add(kwTitleLabel);
-        kwToolbarPanel.add(Box.createHorizontalGlue());
-        kwToolbarPanel.add(addKwBtn);
-        kwToolbarPanel.add(Box.createHorizontalStrut(4));
-        kwToolbarPanel.add(remKwBtn);
-
-        keywordsTopPanel.add(kwToolbarPanel, BorderLayout.NORTH);
-        keywordsTopPanel.add(new JScrollPane(kwTable), BorderLayout.CENTER);
-
-        JSplitPane topSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, pinsTopPanel, keywordsTopPanel);
-        topSplitPane.setResizeWeight(0.7);
-
-        HttpRequestEditor reqEditor = api.userInterface().createHttpRequestEditor();
-        HttpResponseEditor resEditor = api.userInterface().createHttpResponseEditor();
+        // Bottom area: read-only view of the selected node, or the held message (editable)
+        viewReqEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
+        viewResEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
 
         JSplitPane editorSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
-        editorSplitPane.setLeftComponent(reqEditor.uiComponent());
-        editorSplitPane.setRightComponent(resEditor.uiComponent());
+        editorSplitPane.setLeftComponent(viewReqEditor.uiComponent());
+        editorSplitPane.setRightComponent(viewResEditor.uiComponent());
         editorSplitPane.setResizeWeight(0.5);
-
-        JPanel detailsPanel = new JPanel(new BorderLayout());
+        EditorSplit.install(editorSplitPane, pinManager);
 
         JPanel detailToolbar = new JPanel();
         detailToolbar.setLayout(new BoxLayout(detailToolbar, BoxLayout.X_AXIS));
-        detailToolbar.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(1, 0, 0, 0, UIManager.getColor("Separator.foreground")),
-                BorderFactory.createEmptyBorder(3, 6, 3, 6)
-        ));
+        detailToolbar.setBorder(Theme.bar(true, true));
 
-        JButton addBpBtn = new JButton("Add Breakpoint for Selected");
-        addBpBtn.setEnabled(false);
-        addBpBtn.addActionListener(e -> {
-            if (selectedTraffic != null) {
-                pinManager.addPin(selectedTraffic.getHost() + selectedTraffic.getPath(), true);
-            }
-        });
-        detailToolbar.add(addBpBtn);
+        JLabel viewingLabel = new JLabel("Latest request / response \u2014 read-only");
+        viewingLabel.setForeground(UIManager.getColor("Label.disabledForeground"));
+        JButton closeViewBtn = new JButton("\u2715");
+        closeViewBtn.setToolTipText("Close and return to the graph");
+        closeViewBtn.addActionListener(e -> closeDetails());
+        detailToolbar.add(viewingLabel);
         detailToolbar.add(Box.createHorizontalGlue());
+        detailToolbar.add(closeViewBtn);
 
-        detailsPanel.add(editorSplitPane, BorderLayout.CENTER);
-        detailsPanel.add(detailToolbar, BorderLayout.SOUTH);
+        JPanel viewPanel = new JPanel(new BorderLayout());
+        viewPanel.add(editorSplitPane, BorderLayout.CENTER);
+        viewPanel.add(detailToolbar, BorderLayout.NORTH);
+
+        detailsPanel = new JPanel(detailCards);
+        detailsPanel.add(viewPanel, CARD_VIEW);
+        detailsPanel.add(interceptPanel.getPanel(), CARD_HELD);
         detailsPanel.setVisible(false);
 
-        JSplitPane graphDetailSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
+        graphDetailSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
         graphDetailSplit.setResizeWeight(0.5);
 
         trafficPlotPanel = new TrafficPlotPanel(entry -> {
-            selectedTraffic = entry;
-            if (entry != null) {
-                if (entry.getRequest() != null) {
-                    reqEditor.setRequest(entry.getRequest());
-                } else {
-                    reqEditor.setRequest(burp.api.montoya.http.message.requests.HttpRequest.httpRequest(""));
-                }
-                
-                if (entry.getResponse() != null) {
-                    resEditor.setResponse(entry.getResponse());
-                    if (!entry.getMatchedKeywords().isEmpty()) {
-                        resEditor.setSearchExpression(entry.getMatchedKeywords().iterator().next());
-                    } else {
-                        resEditor.setSearchExpression("");
-                    }
-                } else {
-                    resEditor.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(""));
-                    resEditor.setSearchExpression("");
-                }
-                
-                addBpBtn.setEnabled(true);
-                if (!detailsPanel.isVisible()) {
-                    detailsPanel.setVisible(true);
-                    graphDetailSplit.setDividerLocation(0.6);
-                    mainPanel.revalidate();
-                    mainPanel.repaint();
-                }
+            if (entry != null && interceptPanel.showItemFor(entry)) {
+                // A paused node opens its held message for editing
+                showHeld();
+            } else if (entry != null) {
+                showViewFor(entry);
             } else {
-                addBpBtn.setEnabled(false);
-                if (detailsPanel.isVisible()) {
-                    detailsPanel.setVisible(false);
-                    mainPanel.revalidate();
-                    mainPanel.repaint();
-                }
+                // Clicking empty graph space puts the graph back in focus; paused nodes stay clickable
+                closeDetails();
             }
+        }, pinManager.getViewFilter());
+
+        // A breakpoint/step hit (or the next held message) takes over the bottom area
+        interceptPanel.setOnCurrentChanged(item -> {
+            if (item != null) {
+                showHeld();
+            } else if (showingHeld) {
+                // Last held message released: the breakpoint is done, back to the graph
+                closeDetails();
+            }
+        });
+        interceptPanel.setOnClose(this::closeDetails);
+        interceptPanel.setQueueListener(() -> setHeldCount(interceptPanel.getHeldCount()));
+        trafficPlotPanel.setOnFilterChanged(pinManager::setViewFilter);
+        trafficPlotPanel.setOnIncludeHost(host -> changeScope(api, pinManager, host, true));
+        trafficPlotPanel.setOnExcludeHost(host -> {
+            // Extensions can add scope rules but never remove them, so excluding is one-way from here
+            Object[] options = {"Exclude", "Cancel"};
+            int choice = JOptionPane.showOptionDialog(mainPanel,
+                    "Exclude " + host + " from scope?\n\n"
+                    + "Pinpoint can't undo this. To revert it, delete the\n"
+                    + "rule in Target > Scope settings.",
+                    "Exclude from scope", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE,
+                    null, options, options[1]);
+            if (choice == 0) changeScope(api, pinManager, host, false);
         });
 
-        trafficPlotPanel.setOnBreakpointAdd(entry -> {
-            if (entry != null) {
-                if (entry.isBreakpoint()) {
-                    List<PinManager.PinRule> currentPins = pinManager.getPins();
-                    String hostPath = entry.getHost() + entry.getPath();
-                    for (int idx = 0; idx < currentPins.size(); idx++) {
-                        PinManager.PinRule pin = currentPins.get(idx);
-                        if (PinManager.matchesPinPattern(pin, hostPath, entry.getUrl())) {
-                            pinManager.removePin(idx);
-                            break;
-                        }
-                    }
-                } else {
-                    pinManager.addPin(entry.getHost() + entry.getPath(), true);
-                }
-            }
-        });
+        trafficPlotPanel.setOnBreakpointAdd(this::toggleBreakpoint);
 
         JScrollPane graphScroll = new JScrollPane(trafficPlotPanel);
         graphScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
@@ -294,48 +146,45 @@ public class PinsPanel {
 
         JPanel graphToolbar = new JPanel();
         graphToolbar.setLayout(new BoxLayout(graphToolbar, BoxLayout.X_AXIS));
-        graphToolbar.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, UIManager.getColor("Separator.foreground")),
-                BorderFactory.createEmptyBorder(6, 6, 6, 6)
-        ));
+        graphToolbar.setBorder(Theme.bar(false, true));
 
-        JLabel inScopeSym = new JLabel("\u2501\u2501");
-        inScopeSym.setFont(new Font("SansSerif", Font.BOLD, 12));
-        inScopeSym.setForeground(new Color(0, 120, 215));
-        JLabel inScopeTxt = new JLabel("In Scope");
-        inScopeTxt.setFont(new Font("SansSerif", Font.PLAIN, 11));
+        // ---- Group 1: interception -------------------------------------------------------------
+        JToggleButton interceptBtn = new JToggleButton(interceptLabel(pinManager.isInterceptEnabled()), pinManager.isInterceptEnabled());
+        interceptBtn.setToolTipText("Hold requests/responses matching an active breakpoint");
+        interceptBtn.addActionListener(e -> pinManager.setInterceptEnabled(interceptBtn.isSelected()));
+        pinManager.addListener(() -> SwingUtilities.invokeLater(() -> {
+            boolean on = pinManager.isInterceptEnabled();
+            interceptBtn.setSelected(on);
+            interceptBtn.setText(interceptLabel(on));
+        }));
 
-        JLabel outScopeSym = new JLabel("- - -");
-        outScopeSym.setFont(new Font("SansSerif", Font.BOLD, 12));
-        outScopeSym.setForeground(new Color(160, 160, 160));
-        JLabel outScopeTxt = new JLabel("Out of Scope");
-        outScopeTxt.setFont(new Font("SansSerif", Font.PLAIN, 11));
+        // Step mode: hold every visible request/response and release them one at a time
+        JToggleButton stepModeBtn = new JToggleButton("Step Mode");
+        stepModeBtn.setToolTipText("Hold each visible request and response; release them one at a time with Forward (F10). Hidden traffic is skipped.");
+        stepModeBtn.addActionListener(e -> pinManager.setStepMode(stepModeBtn.isSelected()));
 
-        JLabel bpSym = new JLabel("\u2588\u2588");
-        bpSym.setFont(new Font("SansSerif", Font.BOLD, 12));
-        bpSym.setForeground(new Color(255, 100, 30));
-        JLabel bpTxt = new JLabel("Breakpoint");
-        bpTxt.setFont(new Font("SansSerif", Font.PLAIN, 11));
+        // Shown only while something is held: the one sign of held messages while the editor is closed
+        heldBtn = new JButton() {
+            @Override
+            public void updateUI() {
+                super.updateUI();
+                setForeground(Theme.accent());
+            }
+        };
+        heldBtn.setToolTipText("Open the held message");
+        heldBtn.setVisible(false);
+        heldBtn.addActionListener(e -> showHeld());
+        mainPanel.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT)
+                .put(KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_F10, 0), "pinpoint.forward");
+        mainPanel.getActionMap().put("pinpoint.forward", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) { interceptPanel.forwardCurrent(); }
+        });
 
-        graphToolbar.add(inScopeSym);
-        graphToolbar.add(Box.createHorizontalStrut(4));
-        graphToolbar.add(inScopeTxt);
-        graphToolbar.add(Box.createHorizontalStrut(16));
-
-        graphToolbar.add(outScopeSym);
-        graphToolbar.add(Box.createHorizontalStrut(4));
-        graphToolbar.add(outScopeTxt);
-        graphToolbar.add(Box.createHorizontalStrut(16));
-
-        graphToolbar.add(bpSym);
-        graphToolbar.add(Box.createHorizontalStrut(4));
-        graphToolbar.add(bpTxt);
-
-        graphToolbar.add(Box.createHorizontalGlue());
-        
-        JTextField filterField = new JTextField(10);
-        filterField.setMaximumSize(new Dimension(150, 24));
-        filterField.putClientProperty("JTextField.placeholderText", "Filter...");
+        // ---- Group 2: what the map shows ---------------------------------------------------------
+        JTextField filterField = new JTextField(12);
+        filterField.setMaximumSize(new Dimension(Theme.px(180), filterField.getPreferredSize().height));
+        filterField.putClientProperty("JTextField.placeholderText", "Filter\u2026");
+        filterField.setToolTipText("Show only nodes whose URL or grep keyword contains this text");
         filterField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
             public void insertUpdate(javax.swing.event.DocumentEvent e) { updateFilter(); }
             public void removeUpdate(javax.swing.event.DocumentEvent e) { updateFilter(); }
@@ -344,121 +193,342 @@ public class PinsPanel {
                 trafficPlotPanel.setFilterText(filterField.getText());
             }
         });
-        graphToolbar.add(filterField);
-        graphToolbar.add(Box.createHorizontalStrut(6));
-        
+
+        // Focus: the label toggles it, the arrow picks which file types it hides (rebuilt on open for live counts)
+        JPopupMenu focusMenu = new JPopupMenu();
+        SplitToggleButton focusBtn = new SplitToggleButton("Focus", pinManager.getViewFilter().focusMode(), focusMenu);
+        focusBtn.setToolTipText("Hide file types you don't need from the graph and step mode. Click \u25BE to choose which");
+        focusBtn.addActionListener(e -> trafficPlotPanel.setFocusMode(focusBtn.isSelected()));
+        focusMenu.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
+            @Override public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent e) {
+                buildFocusMenu(focusMenu, focusBtn, pinManager);
+            }
+            @Override public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent e) { }
+            @Override public void popupMenuCanceled(javax.swing.event.PopupMenuEvent e) { }
+        });
+
         JToggleButton scopeBtn = new JToggleButton("Only In-Scope");
-        scopeBtn.addActionListener(e -> {
-            trafficPlotPanel.setShowOnlyInScope(scopeBtn.isSelected());
+        scopeBtn.setToolTipText("Show only traffic in Burp's target scope");
+        scopeBtn.addActionListener(e -> trafficPlotPanel.setShowOnlyInScope(scopeBtn.isSelected()));
+
+        // ---- Group 3: clearing the graph and the rules sidebar ------------------------------------
+        sidebarBtn = new JToggleButton();
+        sidebarBtn.setToolTipText("Show or hide the breakpoints and live grep panel");
+        sidebarBtn.addActionListener(e -> setSidebarVisible(sidebarBtn.isSelected()));
+
+        // Lanes per detected flow (page load, route change, action) instead of per host.
+        // On by default: the map is built per user flow; off shows one lane per host
+        // Lanes: a plain dropdown; its label always says how the graph is grouped
+        JPopupMenu lanesMenu = new JPopupMenu();
+        lanesBtn = new JButton();
+        lanesBtn.setToolTipText("How the graph's rows are grouped");
+        lanesBtn.addActionListener(e -> {
+            buildLanesMenu(lanesMenu, pinManager);
+            lanesMenu.show(lanesBtn, 0, lanesBtn.getHeight());
         });
+        setLanes(true, false);
+
+        graphToolbar.add(interceptBtn);
+        graphToolbar.add(Theme.gap(Theme.SPACE_S));
+        graphToolbar.add(stepModeBtn);
+        graphToolbar.add(Theme.gap(Theme.SPACE_S));
+        graphToolbar.add(heldBtn);
+        graphToolbar.add(Theme.divider());
+        graphToolbar.add(filterField);
+        graphToolbar.add(Theme.gap(Theme.SPACE_S));
+        graphToolbar.add(lanesBtn);
+        graphToolbar.add(Theme.gap(Theme.SPACE_S));
+        graphToolbar.add(focusBtn);
+        graphToolbar.add(Theme.gap(Theme.SPACE_S));
         graphToolbar.add(scopeBtn);
-        graphToolbar.add(Box.createHorizontalStrut(6));
-
-        JToggleButton groupTypeBtn = new JToggleButton("Sort by Type");
-        groupTypeBtn.addActionListener(e -> {
-            trafficPlotPanel.setGroupByType(groupTypeBtn.isSelected());
-        });
-        graphToolbar.add(groupTypeBtn);
-        graphToolbar.add(Box.createHorizontalStrut(6));
-
-        JToggleButton dataFlowBtn = new JToggleButton("Data Flow Links");
-        dataFlowBtn.addActionListener(e -> {
-            trafficPlotPanel.setShowDataFlowLinks(dataFlowBtn.isSelected());
-        });
-        graphToolbar.add(dataFlowBtn);
-        graphToolbar.add(Box.createHorizontalStrut(6));
-
         JButton clearBtn = new JButton("Clear Graph");
+        clearBtn.setToolTipText("Remove all nodes and flows (breakpoints and grep rules are kept)");
         clearBtn.addActionListener(e -> {
             pinManager.clearTrafficLog();
-            trafficPlotPanel.updateLog(pinManager.getTrafficLog());
-            selectedTraffic = null;
-            addBpBtn.setEnabled(false);
+            trafficPlotPanel.updateLog(pinManager.getTrafficLog(), pinManager.getRecentHits(), pinManager.getFlows());
         });
+
+        graphToolbar.add(Box.createHorizontalGlue());
         graphToolbar.add(clearBtn);
+        graphToolbar.add(Theme.gap(Theme.SPACE_S));
+        graphToolbar.add(sidebarBtn);
 
         JPanel graphPanel = new JPanel(new BorderLayout());
-        graphPanel.add(graphToolbar, BorderLayout.NORTH);
-        graphPanel.add(graphScroll, BorderLayout.CENTER);
+        // Legend pill floats over the graph's bottom-right corner; hover it for the legend
+        graphPanel.add(new GraphLegendOverlay(graphScroll, () -> pinManager.getViewFilter().onlyInScope()), BorderLayout.CENTER);
         graphDetailSplit.setTopComponent(graphPanel);
         graphDetailSplit.setBottomComponent(detailsPanel);
 
-        JSplitPane mainSplitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, topSplitPane, graphDetailSplit);
-        mainSplitPane.setResizeWeight(0.15);
+        mainSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, graphDetailSplit, sidebarPanel);
+        // Extra width always goes to the graph, never the sidebar
+        mainSplitPane.setResizeWeight(1.0);
+        // The toolbar spans the whole tab, so opening the sidebar never squeezes it
+        mainPanel.add(graphToolbar, BorderLayout.NORTH);
         mainPanel.add(mainSplitPane, BorderLayout.CENTER);
 
-        pinManager.addListener(() -> updateTable(pinManager));
-        updateTable(pinManager);
+        pinManager.addListener(() -> SwingUtilities.invokeLater(() -> {
+            rulesSidebar.rulesChanged();
+            sidebarBtn.setText(rulesSidebar.summary());
+        }));
+        sidebarBtn.setText(rulesSidebar.summary());
+
+        // Throttle traffic events: refresh immediately when idle, otherwise coalesce
+        // into one trailing refresh so rebuilds happen at most once per TRAFFIC_REFRESH_MS
+        trafficRefreshTimer = new Timer(TRAFFIC_REFRESH_MS, e -> refreshTraffic(pinManager));
+        trafficRefreshTimer.setRepeats(false);
 
         pinManager.addTrafficListener(() -> {
-            SwingUtilities.invokeLater(() -> {
-                trafficPlotPanel.updateLog(pinManager.getTrafficLog());
-                updateTable(pinManager);
-            });
+            if (trafficRefreshPending.compareAndSet(false, true)) {
+                SwingUtilities.invokeLater(() -> scheduleTrafficRefresh(pinManager));
+            }
         });
     }
 
-    private static int findPinIndex(PinManager pinManager, PinRuleId id) {
+    private void scheduleTrafficRefresh(PinManager pinManager) {
+        long sinceLastMs = (System.nanoTime() - lastTrafficRefreshNanos) / 1_000_000;
+        long waitMs = TRAFFIC_REFRESH_MS - sinceLastMs;
+        if (waitMs <= 0) {
+            refreshTraffic(pinManager);
+        } else {
+            trafficRefreshTimer.setInitialDelay((int) waitMs);
+            trafficRefreshTimer.restart();
+        }
+    }
+
+    private void refreshTraffic(PinManager pinManager) {
+        trafficRefreshPending.set(false);
+        lastTrafficRefreshNanos = System.nanoTime();
+        trafficPlotPanel.updateLog(pinManager.getTrafficLog(), pinManager.getRecentHits(), pinManager.getFlows());
+        rulesSidebar.refreshCounts();
+    }
+
+    private void setSidebarVisible(boolean visible) {
+        if (sidebarPanel.isVisible() == visible) return;
+        if (!visible) lastSidebarDividerLocation = mainSplitPane.getDividerLocation();
+        sidebarPanel.setVisible(visible);
+        sidebarBtn.setSelected(visible);
+        if (visible) {
+            // Reopen at the width the user last left it
+            int location = lastSidebarDividerLocation > 0
+                    ? lastSidebarDividerLocation
+                    : mainSplitPane.getWidth() - SIDEBAR_DEFAULT_WIDTH;
+            mainSplitPane.setDividerLocation(Math.max(0, location));
+        }
+        mainPanel.revalidate();
+        mainPanel.repaint();
+    }
+
+    /**
+     * Adds (or excludes) every origin seen for a host, e.g. both http:// and https://,
+     * as a URL prefix rule; Burp converts it when advanced scope control is on.
+     */
+    private void changeScope(MontoyaApi api, PinManager pinManager, String host, boolean include) {
+        java.util.Set<String> origins = new java.util.LinkedHashSet<>();
+        for (TrafficEntry entry : pinManager.getTrafficLog()) {
+            if (!entry.getHost().equals(host)) continue;
+            try {
+                // Query strings often hold characters java.net.URI rejects; only the origin matters here
+                java.net.URI u = new java.net.URI(entry.getUrl().split("[?#]", 2)[0]);
+                if (u.getScheme() == null) continue;
+                origins.add(u.getScheme() + "://" + host + (u.getPort() != -1 ? ":" + u.getPort() : "") + "/");
+            } catch (java.net.URISyntaxException ignored) {
+            }
+        }
+        if (origins.isEmpty()) origins.add("https://" + host + "/");
+        List<String> stillOut = new ArrayList<>();
+        for (String origin : origins) {
+            if (include) api.scope().includeInScope(origin);
+            else api.scope().excludeFromScope(origin);
+            api.logging().logToOutput("Pinpoint: " + (include ? "added to" : "excluded from") + " scope: " + origin);
+            if (include && !api.scope().isInScope(origin)) stillOut.add(origin);
+        }
+        pinManager.refreshScope();
+
+        // An existing exclude rule beats the include we just added; say so instead of silently failing
+        if (!stillOut.isEmpty()) {
+            JOptionPane.showMessageDialog(mainPanel,
+                    host + " is still out of scope.\n\n"
+                    + "An exclude rule overrides it. Delete that rule in\n"
+                    + "Target > Scope settings to include this host.",
+                    "Still out of scope", JOptionPane.WARNING_MESSAGE);
+        }
+    }
+
+    /** The Lanes dropdown: how the graph's rows are grouped. */
+    private void buildLanesMenu(JPopupMenu menu, PinManager pinManager) {
+        menu.removeAll();
+        boolean byType = pinManager.getViewFilter().groupByType();
+        ButtonGroup group = new ButtonGroup();
+        addLaneOption(menu, group, "By flow (pages & actions)", flowLanes, () -> setLanes(true, byType));
+        addLaneOption(menu, group, "By host", !flowLanes && !byType, () -> setLanes(false, false));
+        addLaneOption(menu, group, "By host and file type", !flowLanes && byType, () -> setLanes(false, true));
+    }
+
+    private static void addLaneOption(JPopupMenu menu, ButtonGroup group, String text, boolean selected, Runnable action) {
+        JRadioButtonMenuItem item = new JRadioButtonMenuItem(text, selected);
+        item.addActionListener(e -> action.run());
+        group.add(item);
+        menu.add(item);
+    }
+
+    private void setLanes(boolean byFlow, boolean byType) {
+        flowLanes = byFlow;
+        trafficPlotPanel.setGroupByType(byType);
+        trafficPlotPanel.setFlowMode(byFlow);
+        lanesBtn.setText("Lanes: " + (byFlow ? "By flow" : byType ? "By host & type" : "By host") + "  \u25BE");
+    }
+
+    private static final Map<String, String> TYPE_LABELS = Map.of("Endpoints", "Endpoints (pages & APIs)");
+
+    /**
+     * The Focus dropdown: one checkbox per file type (checked = shown while Focus is on), with how
+     * many captured nodes are of that type, and a reset to the defaults. Changing a type turns Focus on.
+     */
+    private void buildFocusMenu(JPopupMenu menu, SplitToggleButton focusBtn, PinManager pinManager) {
+        menu.removeAll();
+        Map<String, Integer> counts = new HashMap<>();
+        for (TrafficEntry e : pinManager.getTrafficLog()) {
+            counts.merge(com.pinpoint.utils.TrafficUtils.getFileType(e.getPath()), 1, Integer::sum);
+        }
+
+        JLabel header = new JLabel("Show while Focus is on");
+        header.setFont(Theme.font(Font.BOLD, -2));
+        header.setForeground(Theme.muted());
+        header.setBorder(BorderFactory.createEmptyBorder(Theme.px(Theme.SPACE_S), Theme.px(Theme.SPACE_M), Theme.px(Theme.SPACE_XS), Theme.px(Theme.SPACE_M)));
+        menu.add(header);
+
+        Set<String> hidden = pinManager.getViewFilter().focusHiddenTypes();
+        for (String type : ViewFilter.ALL_TYPES) {
+            String label = TYPE_LABELS.getOrDefault(type, type) + "   " + counts.getOrDefault(type, 0);
+            JCheckBoxMenuItem item = new JCheckBoxMenuItem(label, !hidden.contains(type));
+            item.putClientProperty("CheckBoxMenuItem.doNotCloseOnMouseClick", true);
+            item.addActionListener(e -> {
+                Set<String> updated = new HashSet<>(pinManager.getViewFilter().focusHiddenTypes());
+                if (item.isSelected()) updated.remove(type);
+                else updated.add(type);
+                applyFocusTypes(focusBtn, updated);
+            });
+            menu.add(item);
+        }
+
+        menu.addSeparator();
+        JMenuItem defaults = new JMenuItem("Restore defaults (hide JS, CSS, images, fonts)");
+        defaults.addActionListener(e -> applyFocusTypes(focusBtn, ViewFilter.STATIC_TYPES));
+        menu.add(defaults);
+    }
+
+    private void applyFocusTypes(SplitToggleButton focusBtn, Set<String> hiddenTypes) {
+        trafficPlotPanel.setFocusHiddenTypes(hiddenTypes);
+        if (!focusBtn.isSelected()) {
+            focusBtn.setSelected(true);
+            trafficPlotPanel.setFocusMode(true);
+        }
+    }
+
+    private static String interceptLabel(boolean on) {
+        return on ? "Intercept on" : "Intercept off";
+    }
+
+    /** Number of messages currently held (breakpoints and steps); called on the EDT. */
+    private void setHeldCount(int count) {
+        heldBtn.setText("\u23F8 " + count + " held");
+        heldBtn.setVisible(count > 0);
+    }
+
+    private TrafficEntry selectedNode() {
+        return trafficPlotPanel != null ? trafficPlotPanel.getSelectedEntry() : null;
+    }
+
+    /**
+     * The node's breakpoint dot (or double-click): adds an exact host+path breakpoint, or removes it.
+     * If the node is only covered by broader rules (contains / regex), those may cover other nodes
+     * too, so the user is asked before they're switched off rather than silently deleted.
+     */
+    private void toggleBreakpoint(TrafficEntry entry) {
+        if (entry == null) return;
+        String hostPath = entry.getHost() + entry.getPath();
+        if (!entry.isBreakpoint()) {
+            pinManager.addPin(hostPath, PinManager.MatchType.EXACT, true, true);
+            return;
+        }
         List<PinManager.PinRule> pins = pinManager.getPins();
+        List<Integer> covering = new ArrayList<>();
         for (int i = 0; i < pins.size(); i++) {
             PinManager.PinRule pin = pins.get(i);
-            if (pin.getPattern().equals(id.pattern) && pin.isExact() == id.isExact) {
-                return i;
+            if (!pin.isEnabled() || !PinManager.matchesPinPattern(pin, hostPath, entry.getUrl())) continue;
+            if (pin.getMatchType() == PinManager.MatchType.EXACT && pin.getPattern().equals(hostPath)) {
+                pinManager.removePin(i);   // this node's own breakpoint
+                return;
             }
+            covering.add(i);
         }
-        return -1;
+        if (covering.isEmpty()) return;
+        StringBuilder rules = new StringBuilder();
+        for (int i : covering) {
+            PinManager.PinRule pin = pins.get(i);
+            rules.append("\n   ").append(pin.getMatchType().label).append(":  ").append(pin.getPattern())
+                    .append("   (").append(pinManager.countPinMatches(pin.getPattern(), pin.getMatchType())).append(" nodes)");
+        }
+        Object[] options = {covering.size() == 1 ? "Turn rule off" : "Turn rules off", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(mainPanel,
+                "This node is covered by a broader breakpoint rule:" + rules
+                        + "\n\nTurning it off affects every node it matches. You can turn it back on, or\n"
+                        + "edit it, under Breakpoints & Grep.",
+                "Turn off breakpoint", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE, null, options, options[1]);
+        if (choice == 0) {
+            for (int i : covering) pinManager.setPinEnabled(i, false);
+        }
     }
 
-    private int trafficOrder(PinManager.PinRule pin, List<TrafficEntry> log) {
-        String hostPath;
-        for (int i = 0; i < log.size(); i++) {
-            TrafficEntry entry = log.get(i);
-            hostPath = entry.getHost() + entry.getPath();
-            if (PinManager.matchesPinPattern(pin, hostPath, entry.getUrl())) return i;
-        }
-        return Integer.MAX_VALUE;
+    /** Bottom area shows the current held message, editable. */
+    private void showHeld() {
+        PendingItem item = interceptPanel.getCurrentItem();
+        if (item == null) return;
+        showingHeld = true;
+        detailCards.show(detailsPanel, CARD_HELD);
+        trafficPlotPanel.setSelectedEntry(item.getEntry());
+        setDetailsVisible(true);
     }
 
-    private void updateTable(PinManager pinManager) {
-        SwingUtilities.invokeLater(() -> {
-            int sel = table.getSelectedRow();
-            tableModel.setRowCount(0);
-            sortedRowIdentities.clear();
-            // Build index list sorted by traffic timeline order
-            List<PinManager.PinRule> original = pinManager.getPins();
-            List<TrafficEntry> log = pinManager.getTrafficLog();
-            List<Integer> indices = new ArrayList<>();
-            for (int i = 0; i < original.size(); i++) indices.add(i);
-            indices.sort((a, b) -> Integer.compare(trafficOrder(original.get(a), log), trafficOrder(original.get(b), log)));
+    /** Bottom area shows a node's latest request/response, read-only. */
+    private void showViewFor(TrafficEntry entry) {
+        showingHeld = false;
+        viewReqEditor.setRequest(entry.getRequest() != null
+                ? entry.getRequest() : burp.api.montoya.http.message.requests.HttpRequest.httpRequest(""));
+        if (entry.getResponse() != null) {
+            viewResEditor.setResponse(entry.getResponse());
+            viewResEditor.setSearchExpression(entry.getMatchedKeywords().isEmpty() ? "" : entry.getMatchedKeywords().iterator().next());
+        } else {
+            viewResEditor.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(""));
+            viewResEditor.setSearchExpression("");
+        }
+        detailCards.show(detailsPanel, CARD_VIEW);
+        trafficPlotPanel.setSelectedEntry(entry);
+        setDetailsVisible(true);
+    }
 
-            for (int origIdx : indices) {
-                PinManager.PinRule pin = original.get(origIdx);
-                sortedRowIdentities.add(new PinRuleId(pin.getPattern(), pin.isExact()));
+    /** Hides the request/response area so the graph takes the whole view. Held messages stay held. */
+    private void closeDetails() {
+        showingHeld = false;
+        trafficPlotPanel.setSelectedEntry(null);
+        setDetailsVisible(false);
+    }
 
-                String interceptType;
-                if (pin.isInterceptRequest() && pin.isInterceptResponse()) interceptType = PinManager.INTERCEPT_REQ_RES;
-                else if (pin.isInterceptRequest()) interceptType = PinManager.INTERCEPT_REQ_ONLY;
-                else if (pin.isInterceptResponse()) interceptType = PinManager.INTERCEPT_RES_ONLY;
-                else interceptType = PinManager.INTERCEPT_REQ_RES;
-                String displayPattern = pin.isExact() ? "(Exact) " + pin.getPattern() : pin.getPattern();
-                tableModel.addRow(new Object[]{pin.isEnabled(), interceptType, displayPattern});
-            }
-            if (sel >= 0 && sel < tableModel.getRowCount()) {
-                table.setRowSelectionInterval(sel, sel);
-            }
-
-            int kwSel = kwTable.getSelectedRow();
-            keywordModel.setRowCount(0);
-            for (PinManager.KeywordRule kw : pinManager.getKeywordRules()) {
-                keywordModel.addRow(new Object[]{kw.isEnabled(), kw.isRegex(), kw.getKeyword()});
-            }
-            if (kwSel >= 0 && kwSel < keywordModel.getRowCount()) {
-                kwTable.setRowSelectionInterval(kwSel, kwSel);
-            }
-        });
+    private void setDetailsVisible(boolean visible) {
+        if (detailsPanel.isVisible() == visible) return;
+        if (!visible) lastDividerLocation = graphDetailSplit.getDividerLocation();
+        detailsPanel.setVisible(visible);
+        // Reopen at the size the user last left it
+        if (visible) {
+            if (lastDividerLocation > 0) graphDetailSplit.setDividerLocation(lastDividerLocation);
+            else graphDetailSplit.setDividerLocation(0.6);
+        }
+        mainPanel.revalidate();
+        mainPanel.repaint();
     }
 
     public void shutdown() {
+        trafficRefreshTimer.stop();
         trafficPlotPanel.shutdown();
     }
 

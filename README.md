@@ -28,10 +28,22 @@ Pinpoint ports the endpoint-specific breakpoint paradigm of browser developer to
   Replaces the traditional HTTP history table with an interactive, node-based map of your live traffic.
 
 * **Point-and-Click Breakpoints**  
-  Double-click any URL on the graph to instantly set a breakpoint on it. No manual regex rules required.
+  Click the breakpoint dot on any node in the graph to set or remove a breakpoint, like in browser DevTools. For broader rules, open **Breakpoints & Grep** and add a *Contains*, *Exact* or *Regex* breakpoint (e.g. `/api/users/\d+/orders`), choosing whether it holds the request, the response or both. Every rule shows how many nodes it matches, and can be edited in place.
 
-* **Isolated Intercept Queue**  
-  Only your targeted endpoints pause. Background traffic automatically flows through without hanging your browser.
+* **Live Grep**  
+  Flag responses whose headers or body contain some text or match a regex. Matching nodes get a badge in the graph, and each rule shows how many it has flagged.
+
+* **Isolated, In-Graph Interception**  
+  Only your targeted endpoints pause. Background traffic automatically flows through without hanging your browser, and paused nodes pulse right in the graph.
+
+* **Live Flow & Step Mode**  
+  Nodes light up as the app moves from step to step, with a trail showing the order. Step Mode holds every visible request and response so you can walk through a flow one message at a time with Forward (F10), like stepping in a debugger.
+
+* **Automatic Flows**  
+  The graph shows one row per user action by default (**Flows**; switch it off for one row per host) (page loads, reloads, form submits, route changes, clicks and searches), with each row's steps numbered in call order. Flows are detected from browser and framework signals (Fetch Metadata headers, Next.js, Remix, Inertia, htmx, Turbo, GraphQL operations, Sentry traces) and named automatically; background polling is ignored.
+
+* **Focus Mode**  
+  Hides static assets (JS, CSS, images, fonts) by default so the graph and Step Mode only show the application's logic. Click the **▾** on the Focus button to choose exactly which file types are shown; the choice is remembered.
 
 * **Automatic Response Pairing**  
   When you forward a paused request, the extension automatically catches and displays the exact matching HTTP response.
@@ -58,12 +70,11 @@ If you want to build it yourself, just clone the repo and run `./gradlew build` 
 ## How to use it
 
 1. **Define your Scope:** First, ensure your target application is properly added to Burp Suite's Target Scope. Pinpoint respects your scope rules, so a clean scope ensures your visual graph isn't cluttered with background noise!
-2. Click on the new **Pinpoint** tab group in Burp Suite. You'll notice it is split into two sub-tabs: **Intercept Queue** and **BreakPoint Flow**.
-3. Go to the **BreakPoint Flow** tab. As you browse your target application, watch your live traffic automatically map out into a visual node graph.
-4. Found an endpoint you want to manipulate? **Double-click** its node in the graph. It will light up orange to indicate a breakpoint has been structurally set.
-5. Switch over to the **Intercept Queue** tab and click the toggle button so it reads **"Intercept is on"**.
-6. Trigger the request again in your browser. Pinpoint will instantly catch it and pause it in the queue table.
-7. Use the embedded editors right there in the **Intercept Queue** tab to modify the request or response, then click **Forward**! 
+2. Open the **Pinpoint** tab in Burp Suite. As you browse your target application, watch your live traffic map out into a visual node graph. Click a node to view its latest request and response (read-only) below the graph.
+3. Found an endpoint you want to manipulate? Hover its node and click the small **○** in its top-right corner (or double-click the node). The dot turns solid orange to show a breakpoint is set, and **Intercept** switches on. Click the dot again to remove it.
+4. Trigger the request again in your browser. The node pulses orange and the area below the graph becomes editable: the held side is marked **✎ editable**, the other side is shown read-only for context.
+5. Modify the request or response, then click **Forward** or press **F10** (or **Drop**). If several messages are held, use **◀ ▶** to move between them; unsent edits are kept when you switch. Click any paused node, or the **⏸ held** button in the toolbar, to jump to a held message.
+6. To walk through a whole flow, turn on **Step Mode** and press **Forward** (or **F10**) to release one message at a time. Anything hidden from the graph (by **Focus**, **Only In-Scope**, the filter, or a collapsed lane) is skipped.
 
 ## License
 

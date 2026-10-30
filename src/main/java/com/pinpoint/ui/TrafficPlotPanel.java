@@ -1,6 +1,9 @@
 package com.pinpoint.ui;
 
+import com.pinpoint.model.FlowTracker;
+import com.pinpoint.model.PinManager;
 import com.pinpoint.model.TrafficEntry;
+import com.pinpoint.model.ViewFilter;
 
 import javax.swing.*;
 import java.awt.*;
@@ -13,78 +16,115 @@ import java.util.function.Consumer;
 
 public class TrafficPlotPanel extends JPanel implements Scrollable {
 
-    private static final int LANE_HEADER_W = 180;
-    private static final int CARD_W = 220;
-    private static final int CARD_H = 52;
-    private static final int CARD_GAP = 12;
-    private static final int LANE_GAP = 2;
-    private static final int PAD = 10;
+    // Geometry, scaled with Burp's UI font (see updateMetrics); each lane has a full-width title bar
+    private int laneTitleH, cardW, cardH, cardGap, laneGap, pad, nestIndent;
 
-    private static final Color COLOR_IN_SCOPE = new Color(0, 120, 215);
-    private static final Color COLOR_OUT_SCOPE = new Color(160, 160, 160);
-    private static final Color COLOR_BREAKPOINT = new Color(255, 100, 30);
-    private static final Color COLOR_SUCCESS = new Color(40, 150, 40);
-    private static final Color COLOR_REDIRECT = new Color(200, 150, 0);
-    private static final Color COLOR_ERROR = new Color(200, 50, 50);
+    // Live activity: how long a node glows after a hit, and the animation frame interval
+    private static final int GLOW_MS = 1500;
+    private static final int GLOW_FRAME_MS = 33;
+    private static final int TRAIL_LENGTH = 8;
 
     private final List<TrafficEntry> log = new ArrayList<>();
-    private int hoveredIndex = -1;
-    private int selectedIndex = -1;
+    private final List<PinManager.Hit> recentHits = new ArrayList<>();
+    private final javax.swing.Timer glowTimer;
+    // Tracked by identity (not card index) so highlights survive re-layouts and log trimming
+    private TrafficEntry hoveredEntry = null;
+    private TrafficEntry selectedEntry = null;
+    // Per-card breakpoint toggle (DevTools-gutter style), hit areas rebuilt on every paint
+    // One per card (same index as cardRects): a node can appear in several flow lanes
+    private final List<Rectangle> breakpointDotRects = new ArrayList<>();
+    private TrafficEntry hoveredDotEntry = null;
     private final Consumer<TrafficEntry> onNodeClicked;
     private Consumer<TrafficEntry> onBreakpointAdd;
-    private boolean showOnlyInScope = false;
-    private boolean groupByType = false;
-    private boolean showDataFlowLinks = false;
-    private String currentFilter = "";
-    private final java.util.Set<String> collapsedLanes = new java.util.HashSet<>();
-    private final List<int[]> dataFlowEdges = new ArrayList<>();
-    
-    private final java.util.concurrent.ExecutorService dataFlowExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
-    private java.util.concurrent.Future<?> currentDataFlowTask = null;
+    // Shared with step mode via onFilterChanged, so hidden traffic is never held
+    private ViewFilter filter;
+    private Consumer<ViewFilter> onFilterChanged;
 
     private final List<Rectangle> cardRects = new ArrayList<>();
     private final List<Integer> cardToLogIndex = new ArrayList<>();
+    private final Map<TrafficEntry, Integer> cardIndexByEntry = new IdentityHashMap<>();
+    // Title bar of each lane (hit area for collapse / menu / tooltip), and the whole lane (for stripes)
     private final Map<String, Rectangle> laneHeaderRects = new LinkedHashMap<>();
+    private final Map<String, Rectangle> laneRects = new HashMap<>();
+    private final List<String> cardLaneKeys = new ArrayList<>();
+    private final List<String> cardLabels = new ArrayList<>();
 
-    public TrafficPlotPanel(Consumer<TrafficEntry> onNodeClicked) {
+    // Flow lanes: one row per detected flow (page load, route change, action), steps left to right
+    private static final String FLOW_LANE_PREFIX = "flow:";
+    private static final String OTHER_FLOW_LANE = FLOW_LANE_PREFIX + "\u0000other";
+    private record FlowLane(String title, String subtitle, boolean inScope) {}
+    private boolean flowMode = false;
+    private final List<FlowTracker.FlowView> flows = new ArrayList<>();
+    private final Map<String, FlowLane> flowLanes = new HashMap<>();
+    // Actions are nested under the page they happened on: indented, and hidden when the page is collapsed
+    private final Map<String, Integer> laneIndent = new HashMap<>();
+    private final Map<String, String> laneParent = new HashMap<>();
+    // "+ Scope" buttons on out-of-scope lane headers, keyed by lane; rebuilt on every paint
+    private final Map<String, Rectangle> scopeButtonRects = new HashMap<>();
+    private Consumer<String> onIncludeHost;
+    private Consumer<String> onExcludeHost;
+
+    public TrafficPlotPanel(Consumer<TrafficEntry> onNodeClicked, ViewFilter initialFilter) {
         this.onNodeClicked = onNodeClicked;
+        this.filter = initialFilter;
+        updateMetrics();
+
+        // Runs only while some node is glowing; stops itself once everything has faded
+        this.glowTimer = new javax.swing.Timer(GLOW_FRAME_MS, e -> {
+            repaint();
+            if (!hasActiveGlow()) ((javax.swing.Timer) e.getSource()).stop();
+        });
 
         MouseAdapter ma = new MouseAdapter() {
             @Override
             public void mouseMoved(MouseEvent e) {
                 int idx = getCardAt(e.getX(), e.getY());
-                if (idx != hoveredIndex) {
-                    hoveredIndex = idx;
-                    if (idx >= 0 && idx < cardToLogIndex.size()) {
-                        TrafficEntry entry = log.get(cardToLogIndex.get(idx));
-                        setToolTipText(entry.getHost() + entry.getPath());
-                    } else {
-                        setToolTipText(null);
-                    }
+                TrafficEntry entry = idx >= 0 && idx < cardToLogIndex.size() ? log.get(cardToLogIndex.get(idx)) : null;
+                String scopeLane = getScopeButtonAt(e.getPoint());
+                TrafficEntry dotEntry = getBreakpointDotAt(e.getPoint());
+                setCursor(Cursor.getPredefinedCursor(scopeLane != null || dotEntry != null ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
+                if (scopeLane != null) {
+                    setToolTipText("Add " + hostOfLane(scopeLane) + " to Burp's target scope");
+                } else if (dotEntry != null) {
+                    setToolTipText(dotEntry.isBreakpoint() ? "Remove breakpoint" : "Set breakpoint");
+                } else if (flowLaneAt(e.getPoint()) != null) {
+                    FlowLane lane = flowLanes.get(flowLaneAt(e.getPoint()));
+                    setToolTipText(lane.title() + "  \u2014  " + lane.subtitle());
+                } else if (entry != hoveredEntry || entry == null || hoveredDotEntry != null) {
+                    setToolTipText(entry != null ? entry.getHost() + entry.getPath() : null);
+                }
+                if (entry != hoveredEntry || dotEntry != hoveredDotEntry) {
+                    hoveredEntry = entry;
+                    hoveredDotEntry = dotEntry;
                     repaint();
                 }
             }
 
             @Override
             public void mouseExited(MouseEvent e) {
-                hoveredIndex = -1;
+                hoveredEntry = null;
+                hoveredDotEntry = null;
                 repaint();
             }
 
             @Override
             public void mouseReleased(MouseEvent e) {
-                if (SwingUtilities.isLeftMouseButton(e) && e.getX() <= LANE_HEADER_W) {
-                    for (Map.Entry<String, Rectangle> laneEntry : laneHeaderRects.entrySet()) {
-                        if (laneEntry.getValue().contains(e.getPoint())) {
-                            String k = laneEntry.getKey();
-                            if (collapsedLanes.contains(k)) collapsedLanes.remove(k);
-                            else collapsedLanes.add(k);
-                            layoutCards();
-                            revalidate();
-                            repaint();
-                            return;
-                        }
-                    }
+                // Breakpoint dot: toggles without selecting the node or opening the editor
+                TrafficEntry dotEntry = getBreakpointDotAt(e.getPoint());
+                if (SwingUtilities.isLeftMouseButton(e) && dotEntry != null) {
+                    if (onBreakpointAdd != null) onBreakpointAdd.accept(dotEntry);
+                    return;
+                }
+                String scopeLane = getScopeButtonAt(e.getPoint());
+                if (SwingUtilities.isLeftMouseButton(e) && scopeLane != null) {
+                    if (onIncludeHost != null) onIncludeHost.accept(hostOfLane(scopeLane));
+                    return;
+                }
+                String titleLane = laneTitleAt(e.getPoint());
+                if (titleLane != null) {
+                    if (SwingUtilities.isRightMouseButton(e)) showLaneContextMenu(e, titleLane);
+                    else if (SwingUtilities.isLeftMouseButton(e)) applyFilter(filter.withLaneToggled(titleLane));
+                    return;
                 }
 
                 if (SwingUtilities.isRightMouseButton(e)) {
@@ -103,14 +143,14 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
                             onBreakpointAdd.accept(log.get(cardToLogIndex.get(idx)));
                         }
                     } else {
-                        selectedIndex = idx;
+                        selectedEntry = log.get(cardToLogIndex.get(idx));
                         repaint();
                         if (onNodeClicked != null) {
-                            onNodeClicked.accept(log.get(cardToLogIndex.get(idx)));
+                            onNodeClicked.accept(selectedEntry);
                         }
                     }
                 } else {
-                    selectedIndex = -1;
+                    selectedEntry = null;
                     repaint();
                     if (onNodeClicked != null) {
                         onNodeClicked.accept(null);
@@ -123,95 +163,167 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
         addMouseListener(ma);
     }
 
-    public void setOnBreakpointAdd(Consumer<TrafficEntry> handler) {
-        this.onBreakpointAdd = handler;
+    public TrafficEntry getSelectedEntry() {
+        return selectedEntry;
     }
 
-    public void setShowOnlyInScope(boolean showOnlyInScope) {
-        this.showOnlyInScope = showOnlyInScope;
-        layoutCards();
-        revalidate();
-        repaint();
-    }
-
-    public void setFilterText(String text) {
-        this.currentFilter = text == null ? "" : text.toLowerCase();
-        layoutCards();
-        revalidate();
-        repaint();
-    }
-
-    public void setGroupByType(boolean groupByType) {
-        this.groupByType = groupByType;
-        layoutCards();
-        revalidate();
-        repaint();
-    }
-
-    public void setShowDataFlowLinks(boolean showDataFlowLinks) {
-        this.showDataFlowLinks = showDataFlowLinks;
-        if (showDataFlowLinks) {
-            computeDataFlowEdgesAsync();
-        } else {
-            dataFlowEdges.clear();
+    /** Highlights a node without notifying onNodeClicked (e.g. when a held message is shown). */
+    public void setSelectedEntry(TrafficEntry entry) {
+        if (entry != selectedEntry) {
+            selectedEntry = entry;
             repaint();
         }
     }
 
-    private boolean matchesFilter(TrafficEntry e) {
-        if (currentFilter.isEmpty()) return true;
-        return e.getUrl().toLowerCase().contains(currentFilter)
-            || (!e.getMatchedKeywords().isEmpty()
-                && e.getMatchedKeywords().stream().anyMatch(k -> k.toLowerCase().contains(currentFilter)));
+    /** Lane header "+ Scope" button / context menu: called with the lane's host. */
+    public void setOnIncludeHost(Consumer<String> handler) {
+        this.onIncludeHost = handler;
     }
 
-    private void computeDataFlowEdgesAsync() {
-        if (currentDataFlowTask != null && !currentDataFlowTask.isDone()) {
-            currentDataFlowTask.cancel(true);
+    public void setOnExcludeHost(Consumer<String> handler) {
+        this.onExcludeHost = handler;
+    }
+
+    private static String hostOfLane(String laneKey) {
+        int split = laneKey.indexOf("::");
+        return split >= 0 ? laneKey.substring(0, split) : laneKey;
+    }
+
+    private TrafficEntry getBreakpointDotAt(Point p) {
+        for (int i = 0; i < breakpointDotRects.size() && i < cardToLogIndex.size(); i++) {
+            if (breakpointDotRects.get(i).contains(p)) return log.get(cardToLogIndex.get(i));
         }
-        currentDataFlowTask = dataFlowExecutor.submit(() -> {
-            List<int[]> edges = new ArrayList<>();
-            List<TrafficEntry> snap = new ArrayList<>(log);
-            for (int i = 0; i < snap.size(); i++) {
-                if (Thread.currentThread().isInterrupted()) return;
-                TrafficEntry to = snap.get(i);
-                if (to.getRequest() == null) continue;
-                String toUrl = to.getUrl();
-                int qIdx = toUrl.indexOf('?');
-                if (qIdx == -1) continue;
-                String query = toUrl.substring(qIdx + 1);
-                if (query.length() < 3) continue;
-                
-                String[] params = query.split("&");
-                for (int j = i - 1; j >= 0; j--) {
-                    if (Thread.currentThread().isInterrupted()) return;
-                    TrafficEntry from = snap.get(j);
-                    if (from.getResponse() != null) {
-                        String fromBody = from.getResponse().bodyToString();
-                        if (fromBody == null) continue;
-                        boolean matched = false;
-                        for (String p : params) {
-                            String[] kv = p.split("=");
-                            if (kv.length == 2 && kv[1].length() >= 8) {
-                                if (fromBody.contains(kv[1])) {
-                                    edges.add(new int[]{j, i});
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (matched) break;
-                    }
-                }
-            }
-            if (!Thread.currentThread().isInterrupted()) {
-                SwingUtilities.invokeLater(() -> {
-                    dataFlowEdges.clear();
-                    dataFlowEdges.addAll(edges);
-                    repaint();
-                });
-            }
-        });
+        return null;
+    }
+
+    private String laneTitleAt(Point p) {
+        for (Map.Entry<String, Rectangle> lane : laneHeaderRects.entrySet()) {
+            if (lane.getValue().contains(p)) return lane.getKey();
+        }
+        return null;
+    }
+
+    private String flowLaneAt(Point p) {
+        String lane = flowMode ? laneTitleAt(p) : null;
+        return lane != null && flowLanes.containsKey(lane) ? lane : null;
+    }
+
+    /** Scope colours only mean something when out-of-scope traffic is shown next to in-scope traffic. */
+    private boolean showScopeColors() {
+        return !filter.onlyInScope();
+    }
+
+    private static boolean isFlowLane(String laneKey) {
+        return laneKey.startsWith(FLOW_LANE_PREFIX);
+    }
+
+    /** Lanes become one row per detected flow instead of one per host. */
+    public void setFlowMode(boolean flowMode) {
+        this.flowMode = flowMode;
+        layoutCards();
+        revalidate();
+        repaint();
+    }
+
+    private String getScopeButtonAt(Point p) {
+        for (Map.Entry<String, Rectangle> e : scopeButtonRects.entrySet()) {
+            if (e.getValue().contains(p)) return e.getKey();
+        }
+        return null;
+    }
+
+    private boolean isHostInScope(String host) {
+        for (TrafficEntry e : log) {
+            if (e.getHost().equals(host) && e.isInScope()) return true;
+        }
+        return false;
+    }
+
+    private void showLaneContextMenu(MouseEvent e, String laneKey) {
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem collapse = new JMenuItem(filter.collapsedLanes().contains(laneKey) ? "Expand lane" : "Collapse lane");
+        collapse.addActionListener(a -> applyFilter(filter.withLaneToggled(laneKey)));
+        if (isFlowLane(laneKey)) {
+            popup.add(collapse);
+            popup.show(this, e.getX(), e.getY());
+            return;
+        }
+        String host = hostOfLane(laneKey);
+        JMenuItem include = new JMenuItem("Add " + host + " to scope");
+        include.addActionListener(a -> { if (onIncludeHost != null) onIncludeHost.accept(host); });
+        JMenuItem exclude = new JMenuItem("Exclude " + host + " from scope");
+        exclude.addActionListener(a -> { if (onExcludeHost != null) onExcludeHost.accept(host); });
+        boolean inScope = isHostInScope(host);
+        include.setEnabled(!inScope);
+        exclude.setEnabled(inScope);
+        popup.add(include);
+        popup.add(exclude);
+        popup.addSeparator();
+        popup.add(collapse);
+        popup.show(this, e.getX(), e.getY());
+    }
+
+    /** Text shortened with an ellipsis to fit maxWidth in the current font. */
+    private static String fitText(Graphics2D g2, String text, int maxWidth) {
+        FontMetrics fm = g2.getFontMetrics();
+        if (fm.stringWidth(text) <= maxWidth) return text;
+        for (int len = text.length() - 1; len > 0; len--) {
+            String candidate = text.substring(0, len) + "\u2026";
+            if (fm.stringWidth(candidate) <= maxWidth) return candidate;
+        }
+        return "\u2026";
+    }
+
+    /** Scales geometry with Burp's UI font, so cards and titles grow with Burp's font-size setting. */
+    private void updateMetrics() {
+        FontMetrics path = getFontMetrics(Theme.mono(Font.BOLD, 0));
+        FontMetrics info = getFontMetrics(Theme.font(Font.PLAIN, -3));
+        FontMetrics badge = getFontMetrics(Theme.font(Font.PLAIN, -4));
+        FontMetrics title = getFontMetrics(Theme.font(Font.BOLD, -1));
+        cardW = Theme.px(220);
+        cardH = Math.max(Theme.px(52), Theme.px(6) + path.getHeight() + info.getHeight() + badge.getHeight() + Theme.px(4));
+        cardGap = Theme.px(Theme.SPACE_L);
+        laneGap = Theme.px(Theme.SPACE_XS);
+        pad = Theme.px(10);
+        laneTitleH = Math.max(Theme.px(24), title.getHeight() + Theme.px(Theme.SPACE_M));
+        nestIndent = Theme.px(22);
+    }
+
+    public void setOnBreakpointAdd(Consumer<TrafficEntry> handler) {
+        this.onBreakpointAdd = handler;
+    }
+
+    public void setOnFilterChanged(Consumer<ViewFilter> handler) {
+        this.onFilterChanged = handler;
+    }
+
+    public void setShowOnlyInScope(boolean showOnlyInScope) {
+        applyFilter(filter.withOnlyInScope(showOnlyInScope));
+    }
+
+    public void setFilterText(String text) {
+        applyFilter(filter.withText(text));
+    }
+
+    public void setGroupByType(boolean groupByType) {
+        applyFilter(filter.withGroupByType(groupByType));
+    }
+
+    public void setFocusMode(boolean focusMode) {
+        applyFilter(filter.withFocusMode(focusMode));
+    }
+
+    /** Which file types Focus hides (see ViewFilter.ALL_TYPES). */
+    public void setFocusHiddenTypes(Set<String> hiddenTypes) {
+        applyFilter(filter.withFocusHiddenTypes(hiddenTypes));
+    }
+
+    private void applyFilter(ViewFilter newFilter) {
+        this.filter = newFilter;
+        if (onFilterChanged != null) onFilterChanged.accept(newFilter);
+        layoutCards();
+        revalidate();
+        repaint();
     }
 
     private void showContextMenu(MouseEvent e, TrafficEntry entry) {
@@ -224,18 +336,6 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
         popup.show(this, e.getX(), e.getY());
     }
 
-    /** Truncates long paths keeping the last segment visible. */
-    private String shortenPath(String path, int maxLen) {
-        if (path.length() <= maxLen) return path;
-        int lastSlash = path.lastIndexOf('/');
-        if (lastSlash > 0) {
-            String lastSegment = path.substring(lastSlash);
-            if (lastSegment.length() <= maxLen - 3) return "..." + lastSegment;
-            return "..." + lastSegment.substring(lastSegment.length() - (maxLen - 3));
-        }
-        return "..." + path.substring(path.length() - (maxLen - 3));
-    }
-
     private int getCardAt(int mx, int my) {
         for (int i = 0; i < cardRects.size(); i++) {
             if (cardRects.get(i).contains(mx, my)) return i;
@@ -243,52 +343,241 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
         return -1;
     }
 
-    public void updateLog(List<TrafficEntry> newLog) {
+    public void updateLog(List<TrafficEntry> newLog, List<PinManager.Hit> newRecentHits, List<FlowTracker.FlowView> newFlows) {
         this.log.clear();
         this.log.addAll(newLog);
-        if (selectedIndex >= cardRects.size()) selectedIndex = -1;
-        if (showDataFlowLinks) computeDataFlowEdgesAsync();
+        this.flows.clear();
+        this.flows.addAll(newFlows);
+        this.recentHits.clear();
+        this.recentHits.addAll(newRecentHits);
+        if (hasActiveGlow() && !glowTimer.isRunning()) glowTimer.start();
+        if (selectedEntry != null && !containsIdentity(log, selectedEntry)) selectedEntry = null;
+        if (hoveredEntry != null && !containsIdentity(log, hoveredEntry)) hoveredEntry = null;
         layoutCards();
         revalidate();
         repaint();
     }
 
-    public void shutdown() {
-        if (currentDataFlowTask != null) {
-            currentDataFlowTask.cancel(true);
+    private static boolean containsIdentity(List<TrafficEntry> entries, TrafficEntry target) {
+        for (TrafficEntry e : entries) {
+            if (e == target) return true;
         }
-        dataFlowExecutor.shutdownNow();
+        return false;
+    }
+
+    private boolean hasActiveGlow() {
+        long now = System.currentTimeMillis();
+        for (TrafficEntry e : log) {
+            if (now - e.getLastActivityMillis() < GLOW_MS || e.isPaused()) return true;
+        }
+        return false;
+    }
+
+    /** 1.0 right after the hit, fading linearly to 0.0 after GLOW_MS. */
+    private static float glowStrength(long activityMillis, long now) {
+        long age = Math.max(0, now - activityMillis);
+        if (age >= GLOW_MS) return 0f;
+        return 1f - (float) age / GLOW_MS;
+    }
+
+    /** Requests glow blue; responses glow by status class. */
+    private static Color activityColor(TrafficEntry entry) {
+        if (entry.getLastActivity() == TrafficEntry.Activity.REQUEST) return Theme.inScope();
+        int status = entry.getStatusCode();
+        if (status >= 400) return Theme.error();
+        if (status >= 300) return Theme.redirect();
+        return Theme.success();
+    }
+
+    /** Point on the border of r along the line from its center toward (tx, ty). */
+    private static double[] edgePoint(Rectangle r, double tx, double ty) {
+        double cx = r.getCenterX(), cy = r.getCenterY();
+        double dx = tx - cx, dy = ty - cy;
+        if (dx == 0 && dy == 0) return new double[]{cx, cy};
+        double sx = dx == 0 ? Double.MAX_VALUE : (r.width / 2.0 + 3) / Math.abs(dx);
+        double sy = dy == 0 ? Double.MAX_VALUE : (r.height / 2.0 + 3) / Math.abs(dy);
+        double s = Math.min(sx, sy);
+        return new double[]{cx + dx * s, cy + dy * s};
+    }
+
+    /**
+     * Arrows between consecutive recent hits on visible cards, fading with the later hit's glow.
+     * Hidden hits are skipped, so the trail connects straight across them.
+     */
+    private void drawTrail(Graphics2D g2, long now) {
+        List<PinManager.Hit> visible = new ArrayList<>();
+        for (PinManager.Hit hit : recentHits) {
+            if (cardIndexByEntry.containsKey(hit.entry())) visible.add(hit);
+        }
+        int start = Math.max(0, visible.size() - TRAIL_LENGTH);
+        TrafficEntry prev = null;
+        for (PinManager.Hit hit : visible.subList(start, visible.size())) {
+            TrafficEntry cur = hit.entry();
+            if (prev != null && prev != cur) {
+                float strength = glowStrength(hit.millis(), now);
+                if (strength > 0) {
+                    drawTrailArrow(g2, cardRects.get(cardIndexByEntry.get(prev)), cardRects.get(cardIndexByEntry.get(cur)), strength);
+                }
+            }
+            prev = cur;
+        }
+    }
+
+    /** Pulsing orange halo and a pause badge for a node holding a request and/or response. */
+    private void drawPaused(Graphics2D g2, TrafficEntry entry, Rectangle r, long now) {
+        float pulse = 0.55f + 0.45f * (float) Math.sin(now / 200.0);
+        int halo = Theme.px(3);
+        g2.setColor(Theme.withAlpha(Theme.accent(), (int) (pulse * 200)));
+        g2.setStroke(new BasicStroke(Theme.px(4)));
+        g2.draw(new RoundRectangle2D.Float(r.x - halo, r.y - halo, r.width + 2 * halo, r.height + 2 * halo, Theme.px(12), Theme.px(12)));
+        g2.setStroke(new BasicStroke(1f));
+
+        int reqs = entry.getPausedRequests();
+        int resps = entry.getPausedResponses();
+        String label = "\u23F8 " + (reqs > 0 && resps > 0 ? "REQ+RES" : reqs > 0 ? "REQ" : "RES");
+        int total = reqs + resps;
+        if (total > 1) label += " \u00D7" + total;
+        g2.setFont(Theme.font(Font.BOLD, -3));
+        FontMetrics fm = g2.getFontMetrics();
+        int bw = fm.stringWidth(label) + Theme.px(Theme.SPACE_M);
+        int bh = fm.getHeight();
+        int bx = r.x + r.width - bw - Theme.px(6);
+        int by = r.y + r.height - bh - Theme.px(3);
+        g2.setColor(Theme.accent());
+        g2.fillRoundRect(bx, by, bw, bh, Theme.px(6), Theme.px(6));
+        g2.setColor(Color.WHITE);
+        g2.drawString(label, bx + Theme.px(Theme.SPACE_S), by + fm.getAscent());
+    }
+
+    private void drawTrailArrow(Graphics2D g2, Rectangle from, Rectangle to, float strength) {
+        double[] p1 = edgePoint(from, to.getCenterX(), to.getCenterY());
+        double[] p2 = edgePoint(to, from.getCenterX(), from.getCenterY());
+        // Bend the arrow sideways so it doesn't sit on top of the lane connectors
+        double mx = (p1[0] + p2[0]) / 2, my = (p1[1] + p2[1]) / 2;
+        double dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+        double len = Math.max(1, Math.hypot(dx, dy));
+        double bend = Math.min(30, len / 4);
+        double ctrlX = mx - dy / len * bend, ctrlY = my + dx / len * bend;
+
+        g2.setColor(Theme.withAlpha(Theme.trail(), (int) (strength * 220)));
+        g2.setStroke(new BasicStroke(Theme.px(2), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        java.awt.geom.Path2D path = new java.awt.geom.Path2D.Double();
+        path.moveTo(p1[0], p1[1]);
+        path.quadTo(ctrlX, ctrlY, p2[0], p2[1]);
+        g2.draw(path);
+
+        // Arrowhead aligned with the curve's tangent at the end
+        double ax = p2[0] - ctrlX, ay = p2[1] - ctrlY;
+        double alen = Math.max(1, Math.hypot(ax, ay));
+        ax /= alen;
+        ay /= alen;
+        int size = Theme.px(7);
+        int[] xs = {(int) p2[0], (int) (p2[0] - ax * size - ay * size * 0.6), (int) (p2[0] - ax * size + ay * size * 0.6)};
+        int[] ys = {(int) p2[1], (int) (p2[1] - ay * size + ax * size * 0.6), (int) (p2[1] - ay * size - ax * size * 0.6)};
+        g2.fillPolygon(xs, ys, 3);
+        g2.setStroke(new BasicStroke(1f));
+    }
+
+    public void shutdown() {
+        glowTimer.stop();
     }
 
     private void layoutCards() {
+        updateMetrics();
         cardRects.clear();
         cardToLogIndex.clear();
+        cardIndexByEntry.clear();
         laneHeaderRects.clear();
+        laneRects.clear();
+        cardLaneKeys.clear();
+        cardLabels.clear();
 
+        LinkedHashMap<String, List<Integer>> hostGroups = flowMode ? groupByFlow() : groupByHost();
+
+        int availableWidth = getWidth();
+        if (getParent() instanceof JViewport) {
+            availableWidth = ((JViewport) getParent()).getWidth();
+        }
+        int minWidth = cardW + cardGap * 2;
+        if (availableWidth <= minWidth) {
+            availableWidth = minWidth;
+        }
+
+        int y = pad;
+        int maxX = minWidth;
+        for (Map.Entry<String, List<Integer>> group : hostGroups.entrySet()) {
+            List<Integer> indices = group.getValue();
+            String groupKey = group.getKey();
+            int startY = y;
+            
+            String parent = laneParent.get(groupKey);
+            if (parent != null && filter.collapsedLanes().contains(parent)) continue;
+            int indent = laneIndent.getOrDefault(groupKey, 0);
+
+            laneHeaderRects.put(groupKey, new Rectangle(indent, startY, availableWidth - indent, laneTitleH));
+            if (filter.collapsedLanes().contains(groupKey)) {
+                laneRects.put(groupKey, new Rectangle(0, startY, availableWidth, laneTitleH));
+                y += laneTitleH + laneGap;
+                continue;
+            }
+
+            int x = cardGap + indent;
+            int currentY = startY + laneTitleH + 4;
+            int rows = 1;
+
+            int step = 0;
+            for (int idx : indices) {
+                step++;
+                if (x + cardW > availableWidth - cardGap && x > cardGap + indent) {
+                    x = cardGap + indent;
+                    currentY += cardH + cardGap;
+                    rows++;
+                }
+                cardIndexByEntry.putIfAbsent(log.get(idx), cardRects.size());
+                cardRects.add(new Rectangle(x, currentY, cardW, cardH));
+                cardToLogIndex.add(idx);
+                cardLaneKeys.add(groupKey);
+                // Flow lanes number their steps; host lanes show the node's position in the log
+                boolean numbered = flowMode && !groupKey.equals(OTHER_FLOW_LANE);
+                cardLabels.add(numbered ? String.valueOf(step) : "#" + (idx + 1));
+                x += cardW + cardGap;
+                maxX = Math.max(maxX, x);
+            }
+            
+            int laneHeight = laneTitleH + 4 + rows * (cardH + cardGap);
+            laneRects.put(groupKey, new Rectangle(0, startY, availableWidth, laneHeight));
+
+            y += laneHeight + laneGap;
+        }
+
+        setPreferredSize(new Dimension(maxX, Math.max(y + pad, 120)));
+    }
+
+    private LinkedHashMap<String, List<Integer>> groupByHost() {
         LinkedHashMap<String, List<Integer>> tempGroups = new LinkedHashMap<>();
         for (int i = 0; i < log.size(); i++) {
             TrafficEntry e = log.get(i);
-            if (!matchesFilter(e)) continue;
+            if (!filter.matches(e)) continue;
 
             if (e.isInScope()) {
-                String key = groupByType ? e.getHost() + "::" + com.pinpoint.utils.TrafficUtils.getFileType(e.getPath()) : e.getHost();
+                String key = filter.laneKey(e.getHost(), e.getPath());
                 tempGroups.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
             }
         }
-        if (!showOnlyInScope) {
+        if (!filter.onlyInScope()) {
             for (int i = 0; i < log.size(); i++) {
                 TrafficEntry e = log.get(i);
-                if (!matchesFilter(e)) continue;
+                if (!filter.matches(e)) continue;
 
                 if (!e.isInScope()) {
-                    String key = groupByType ? e.getHost() + "::" + com.pinpoint.utils.TrafficUtils.getFileType(e.getPath()) : e.getHost();
+                    String key = filter.laneKey(e.getHost(), e.getPath());
                     tempGroups.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
                 }
             }
         }
 
         LinkedHashMap<String, List<Integer>> hostGroups = new LinkedHashMap<>();
-        if (groupByType) {
+        if (filter.groupByType()) {
             String[] typeOrder = {"Endpoints", "JavaScript", "CSS", "Images", "Fonts", "Other"};
             List<String> hosts = new ArrayList<>();
             for (String k : tempGroups.keySet()) {
@@ -304,52 +593,62 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
         } else {
             hostGroups.putAll(tempGroups);
         }
+        return hostGroups;
+    }
 
-        int availableWidth = getWidth();
-        if (getParent() instanceof JViewport) {
-            availableWidth = ((JViewport) getParent()).getWidth();
+    /** One lane per flow (its latest run's steps, in order), then an "Other traffic" lane for the rest. */
+    private LinkedHashMap<String, List<Integer>> groupByFlow() {
+        flowLanes.clear();
+        laneIndent.clear();
+        laneParent.clear();
+        Map<String, Integer> actionCounts = new HashMap<>();
+        for (FlowTracker.FlowView flow : flows) {
+            if (flow.parentKey() != null) actionCounts.merge(flow.parentKey(), 1, Integer::sum);
         }
-        int minWidth = LANE_HEADER_W + CARD_W + CARD_GAP * 2;
-        if (availableWidth <= minWidth) {
-            availableWidth = minWidth;
-        }
+        Map<TrafficEntry, Integer> logIndex = new IdentityHashMap<>();
+        for (int i = 0; i < log.size(); i++) logIndex.put(log.get(i), i);
 
-        int y = PAD;
-        int maxX = minWidth;
-        for (Map.Entry<String, List<Integer>> group : hostGroups.entrySet()) {
-            List<Integer> indices = group.getValue();
-            String groupKey = group.getKey();
-            int startY = y;
-            
-            if (collapsedLanes.contains(groupKey)) {
-                laneHeaderRects.put(groupKey, new Rectangle(0, startY, LANE_HEADER_W, 30));
-                y += 30 + LANE_GAP;
-                continue;
+        LinkedHashMap<String, List<Integer>> groups = new LinkedHashMap<>();
+        Set<TrafficEntry> assigned = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (FlowTracker.FlowView flow : flows) {
+            List<Integer> steps = new ArrayList<>();
+            boolean inScope = false;
+            for (TrafficEntry step : flow.steps()) {
+                Integer idx = logIndex.get(step);
+                if (idx == null) continue;   // evicted from the log
+                assigned.add(step);
+                if (!filter.matches(step)) continue;
+                steps.add(idx);
+                inScope |= step.isInScope();
             }
-
-            int x = LANE_HEADER_W + CARD_GAP;
-            int currentY = startY + CARD_GAP;
-            int rows = 1;
-
-            for (int idx : indices) {
-                if (x + CARD_W > availableWidth - CARD_GAP && x > LANE_HEADER_W + CARD_GAP) {
-                    x = LANE_HEADER_W + CARD_GAP;
-                    currentY += CARD_H + CARD_GAP;
-                    rows++;
-                }
-                cardRects.add(new Rectangle(x, currentY, CARD_W, CARD_H));
-                cardToLogIndex.add(idx);
-                x += CARD_W + CARD_GAP;
-                maxX = Math.max(maxX, x);
+            if (steps.isEmpty()) continue;
+            String laneKey = FLOW_LANE_PREFIX + flow.key();
+            groups.put(laneKey, steps);
+            String parentLane = flow.parentKey() != null ? FLOW_LANE_PREFIX + flow.parentKey() : null;
+            if (parentLane != null && groups.containsKey(parentLane)) {
+                laneIndent.put(laneKey, nestIndent);
+                laneParent.put(laneKey, parentLane);
             }
-            
-            int laneHeight = rows * (CARD_H + CARD_GAP) + CARD_GAP;
-            laneHeaderRects.put(groupKey, new Rectangle(0, startY, LANE_HEADER_W, laneHeight));
-
-            y += laneHeight + LANE_GAP;
+            String runs = flow.runs() > 1 ? "\u00D7" + flow.runs() + " \u00B7 " : "";
+            int actions = actionCounts.getOrDefault(flow.key(), 0);
+            String nested = actions == 0 ? "" : " \u00B7 " + actions + (actions == 1 ? " action" : " actions");
+            flowLanes.put(laneKey, new FlowLane(flow.name(), runs + flow.kind().label + nested, inScope));
         }
 
-        setPreferredSize(new Dimension(maxX, Math.max(y + PAD, 120)));
+        List<Integer> other = new ArrayList<>();
+        boolean otherInScope = false;
+        for (int i = 0; i < log.size(); i++) {
+            TrafficEntry e = log.get(i);
+            if (!assigned.contains(e) && filter.matches(e)) {
+                other.add(i);
+                otherInScope |= e.isInScope();
+            }
+        }
+        if (!other.isEmpty()) {
+            groups.put(OTHER_FLOW_LANE, other);
+            flowLanes.put(OTHER_FLOW_LANE, new FlowLane("Other traffic", "not part of a detected flow", otherInScope));
+        }
+        return groups;
     }
 
     @Override
@@ -360,227 +659,297 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
 
     @Override
     protected void paintComponent(Graphics g) {
+        setBackground(Theme.background());
         super.paintComponent(g);
         Graphics2D g2 = (Graphics2D) g;
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-
-        Color selBg = UIManager.getColor("List.selectionBackground");
-        if (selBg == null) selBg = new Color(51, 153, 255);
+        g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         int fullW = Math.max(getWidth(), (int) getPreferredSize().getWidth());
 
         if (log.isEmpty()) {
-            g2.setColor(Color.GRAY);
-            g2.setFont(new Font("SansSerif", Font.ITALIC, 12));
-            g2.drawString("No traffic captured yet. Browse with the proxy to build the flow.", getWidth() / 2 - 200, getHeight() / 2);
+            drawCenteredMessage(g2, "No traffic captured yet. Browse with the proxy to build the map.");
             return;
         }
 
-        // Draw lanes
+        // Draw lanes: alternating stripes, each with a full-width title bar
+        scopeButtonRects.clear();
         int laneIdx = 0;
         for (Map.Entry<String, Rectangle> laneEntry : laneHeaderRects.entrySet()) {
             String groupKey = laneEntry.getKey();
-            Rectangle hr = laneEntry.getValue();
-            
-            String host = groupKey;
-            String type = null;
-            if (groupKey.contains("::")) {
-                int split = groupKey.indexOf("::");
-                host = groupKey.substring(0, split);
-                type = groupKey.substring(split + 2);
-            }
-
-            final String fHost = host;
-            boolean isInScope = log.stream().anyMatch(e -> e.getHost().equals(fHost) && e.isInScope());
-
-            // Lane stripe
+            Rectangle lane = laneRects.getOrDefault(groupKey, laneEntry.getValue());
             if (laneIdx % 2 == 1) {
-                g2.setColor(new Color(0, 0, 0, 12));
-                g2.fillRect(0, hr.y, fullW, hr.height);
+                g2.setColor(Theme.overlay(8));
+                g2.fillRect(0, lane.y, fullW, lane.height);
+            }
+            g2.setColor(Theme.separator());
+            g2.drawLine(0, lane.y + lane.height, fullW, lane.y + lane.height);
+            if (laneParent.containsKey(groupKey)) {
+                // Guide line tying an action to the page above it
+                g2.setColor(Theme.overlay(45));
+                g2.setStroke(new BasicStroke(Theme.px(2)));
+                g2.drawLine(nestIndent / 2, lane.y, nestIndent / 2, lane.y + lane.height);
+                g2.setStroke(new BasicStroke(1f));
             }
 
-            // Lane header background
-            g2.setColor(isInScope ? new Color(COLOR_IN_SCOPE.getRed(), COLOR_IN_SCOPE.getGreen(), COLOR_IN_SCOPE.getBlue(), 15)
-                    : new Color(0, 0, 0, 8));
-            g2.fillRect(0, hr.y, LANE_HEADER_W, hr.height);
-
-            // Separator
-            g2.setColor(new Color(0, 0, 0, 30));
-            g2.drawLine(LANE_HEADER_W, hr.y, LANE_HEADER_W, hr.y + hr.height);
-            g2.drawLine(0, hr.y + hr.height, fullW, hr.y + hr.height);
-
-            // Scope dot + host label
-            int dotY = hr.y + hr.height / 2 - 4;
-            g2.setColor(isInScope ? COLOR_IN_SCOPE : COLOR_OUT_SCOPE);
-            g2.fillOval(8, dotY, 8, 8);
-
-            // Collapsible arrow
-            g2.setFont(new Font("SansSerif", Font.BOLD, 10));
-            g2.setColor(new Color(120, 120, 120, 180));
-            g2.drawString(collapsedLanes.contains(groupKey) ? "▶" : "▼", LANE_HEADER_W - 16, hr.y + 16);
-
-            g2.setFont(new Font("SansSerif", Font.BOLD, 11));
-            g2.setColor(isInScope ? COLOR_IN_SCOPE : COLOR_OUT_SCOPE);
-            String displayHost = host.length() > 16 ? host.substring(0, 13) + "..." : host;
-            
-            if (type != null) {
-                g2.drawString(displayHost, 22, hr.y + hr.height / 2 - 4);
-                g2.setFont(new Font("SansSerif", Font.BOLD, 9));
-                g2.setColor(isInScope ? new Color(COLOR_IN_SCOPE.getRed(), COLOR_IN_SCOPE.getGreen(), COLOR_IN_SCOPE.getBlue(), 180) : new Color(130, 130, 130));
-                g2.drawString(type.toUpperCase(), 22, hr.y + hr.height / 2 + 8);
+            FlowLane flowLane = flowLanes.get(groupKey);
+            if (isFlowLane(groupKey) && flowLane != null) {
+                drawLaneTitle(g2, groupKey, laneEntry.getValue(), fullW, flowLane.title(), flowLane.subtitle(), flowLane.inScope(), null);
             } else {
-                g2.drawString(displayHost, 22, hr.y + hr.height / 2 + 4);
+                String host = hostOfLane(groupKey);
+                String type = groupKey.contains("::") ? groupKey.substring(groupKey.indexOf("::") + 2).toUpperCase() : null;
+                boolean inScope = isHostInScope(host);
+                // "+ Scope" pill on out-of-scope host lanes: one click adds the host to Burp's scope
+                String pillLane = !inScope && host.length() > 1 ? groupKey : null;
+                drawLaneTitle(g2, groupKey, laneEntry.getValue(), fullW, host, type, inScope, pillLane);
             }
-
             laneIdx++;
         }
 
-        // Draw connectors
+        // Draw connectors between consecutive steps in a lane row
         g2.setStroke(new BasicStroke(1f));
+        int arrow = Theme.px(5);
         for (int i = 0; i < cardRects.size() - 1; i++) {
-            int logIdx = cardToLogIndex.get(i);
-            int nextLogIdx = cardToLogIndex.get(i + 1);
-            if (log.get(logIdx).getHost().equals(log.get(nextLogIdx).getHost())) {
+            if (cardLaneKeys.get(i).equals(cardLaneKeys.get(i + 1))) {
                 Rectangle from = cardRects.get(i);
                 Rectangle to = cardRects.get(i + 1);
                 if (from.y == to.y && from.x < to.x) {
                     int fy = from.y + from.height / 2;
-                    g2.setColor(new Color(0, 0, 0, 40));
+                    g2.setColor(Theme.overlay(70));
                     g2.drawLine(from.x + from.width + 1, fy, to.x - 1, fy);
-                    g2.fillPolygon(new int[]{to.x, to.x - 5, to.x - 5}, new int[]{fy, fy - 3, fy + 3}, 3);
+                    g2.fillPolygon(new int[]{to.x, to.x - arrow, to.x - arrow}, new int[]{fy, fy - arrow / 2 - 1, fy + arrow / 2 + 1}, 3);
                 }
             }
         }
 
-        // Draw data flow edges
-        if (showDataFlowLinks && !dataFlowEdges.isEmpty()) {
-            g2.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 0, new float[]{4}, 0));
-            g2.setColor(new Color(255, 140, 0, 160));
-            for (int[] edge : dataFlowEdges) {
-                int fIdx = cardToLogIndex.indexOf(edge[0]);
-                int tIdx = cardToLogIndex.indexOf(edge[1]);
-                if (fIdx >= 0 && tIdx >= 0) {
-                    Rectangle fromR = cardRects.get(fIdx);
-                    Rectangle toR = cardRects.get(tIdx);
-                    int x1 = fromR.x + fromR.width;
-                    int y1 = fromR.y + fromR.height / 2;
-                    int x2 = toR.x;
-                    int y2 = toR.y + toR.height / 2;
-                    int ctrlX = (x1 + x2) / 2;
-                    java.awt.geom.Path2D path = new java.awt.geom.Path2D.Double();
-                    path.moveTo(x1, y1);
-                    path.curveTo(ctrlX, y1, ctrlX, y2, x2, y2);
-                    g2.draw(path);
-                }
-            }
-            g2.setStroke(new BasicStroke(1f));
-        }
+        long now = System.currentTimeMillis();
 
         // Draw cards
+        breakpointDotRects.clear();
         for (int i = 0; i < cardRects.size(); i++) {
             int logIdx = cardToLogIndex.get(i);
             TrafficEntry entry = log.get(logIdx);
             Rectangle r = cardRects.get(i);
-            drawCard(g2, entry, r, i == hoveredIndex, i == selectedIndex, selBg, logIdx);
+            drawCard(g2, entry, r, entry == hoveredEntry, entry == selectedEntry, cardLabels.get(i), now);
+        }
+
+        // Live trail on top so it stays visible across lanes; flow lanes already show the order
+        if (!flowMode) drawTrail(g2, now);
+
+        if (flowMode && laneHeaderRects.isEmpty()) {
+            drawCenteredMessage(g2, "No flows yet. Load or refresh a page, or use the app, to see its flows.");
         }
     }
 
-    private void drawCard(Graphics2D g2, TrafficEntry entry, Rectangle r, boolean hovered, boolean selected, Color selBg, int logIdx) {
-        Color cardBg = getBackground();
-        if (cardBg == null) cardBg = Color.WHITE;
+    // Card labels depend only on path, font and width; computing them is the costliest part of
+    // drawing a card, and paint runs ~30x/s while nodes glow. Bounded, and reset on font change.
+    private final Map<String, String> labelCache = new HashMap<>();
+    private Font labelCacheFont;
+
+    private String cardLabel(String path, FontMetrics fm, int maxWidth) {
+        if (!fm.getFont().equals(labelCacheFont) || labelCache.size() > 4000) {
+            labelCache.clear();
+            labelCacheFont = fm.getFont();
+        }
+        return labelCache.computeIfAbsent(maxWidth + "|" + path,
+                k -> com.pinpoint.utils.TrafficUtils.endpointLabel(path, fm::stringWidth, maxWidth));
+    }
+
+    private void drawCenteredMessage(Graphics2D g2, String message) {
+        g2.setColor(Theme.muted());
+        g2.setFont(Theme.font(Font.ITALIC, 0));
+        FontMetrics fm = g2.getFontMetrics();
+        g2.drawString(message, Math.max(Theme.px(Theme.SPACE_L), (getWidth() - fm.stringWidth(message)) / 2), getHeight() / 2);
+    }
+
+    /**
+     * A lane's title bar: collapse arrow, scope dot, the full title, a muted subtitle after it
+     * (flow runs and kind, or the file type), and optionally a "+ Scope" pill right after that.
+     */
+    private void drawLaneTitle(Graphics2D g2, String laneKey, Rectangle bar, int fullW, String title,
+                               String subtitle, boolean inScope, String scopePillLane) {
+        boolean scopeColors = showScopeColors();
+        Color accent = !scopeColors ? Theme.foreground() : inScope ? Theme.inScope() : Theme.outOfScope();
+        g2.setColor(scopeColors ? Theme.withAlpha(accent, inScope ? 22 : 12) : Theme.overlay(10));
+        g2.fillRect(bar.x, bar.y, fullW - bar.x, bar.height);
+
+        Font titleFont = Theme.font(Font.BOLD, -1);
+        FontMetrics tm = g2.getFontMetrics(titleFont);
+        int baseline = bar.y + (bar.height + tm.getAscent() - tm.getDescent()) / 2;
+        int x = bar.x + Theme.px(Theme.SPACE_M);
+
+        g2.setFont(Theme.font(Font.PLAIN, -3));
+        g2.setColor(Theme.muted());
+        String arrow = filter.collapsedLanes().contains(laneKey) ? "\u25B6" : "\u25BC";
+        g2.drawString(arrow, x, baseline);
+        x += g2.getFontMetrics().stringWidth(arrow) + Theme.px(Theme.SPACE_M);
+        if (scopeColors) {
+            int dot = Theme.px(8);
+            g2.setColor(accent);
+            g2.fillOval(x, bar.y + (bar.height - dot) / 2, dot, dot);
+            x += dot + Theme.px(6);
+        }
+
+        int available = Math.max(Theme.px(60), bar.x + bar.width - x - Theme.px(90));
+        g2.setFont(titleFont);
+        g2.setColor(accent);
+        String shownTitle = fitText(g2, title, available);
+        g2.drawString(shownTitle, x, baseline);
+        x += tm.stringWidth(shownTitle) + Theme.px(10);
+
+        if (subtitle != null && !subtitle.isEmpty()) {
+            g2.setFont(Theme.font(Font.PLAIN, -3));
+            g2.setColor(Theme.muted());
+            g2.drawString(subtitle, x, baseline);
+            x += g2.getFontMetrics().stringWidth(subtitle) + Theme.px(10);
+        }
+
+        if (scopePillLane != null) {
+            g2.setFont(Theme.font(Font.BOLD, -3));
+            FontMetrics pm = g2.getFontMetrics();
+            String pillText = "+ Scope";
+            int pw = pm.stringWidth(pillText) + Theme.px(10);
+            int ph = pm.getHeight() + Theme.px(2);
+            Rectangle pill = new Rectangle(x, bar.y + (bar.height - ph) / 2, pw, ph);
+            scopeButtonRects.put(scopePillLane, pill);
+            g2.setColor(Theme.inScope());
+            g2.drawRoundRect(pill.x, pill.y, pill.width, pill.height, ph, ph);
+            g2.drawString(pillText, pill.x + Theme.px(5), pill.y + Theme.px(1) + pm.getAscent());
+        }
+    }
+
+    /**
+     * One node: path (status colour), status history and hit count, method and REQ/RES, keyword
+     * badge, step / log number and breakpoint dot. All positions derive from font metrics so the
+     * card scales with Burp's font size; all colours come from the theme.
+     */
+    private void drawCard(Graphics2D g2, TrafficEntry entry, Rectangle r, boolean hovered, boolean selected, String label, long now) {
+        int radius = Theme.px(Theme.RADIUS);
+        Color selBg = Theme.selectionBackground();
+        Color selFg = Theme.selectionForeground();
+
+        // Live activity halo, drawn behind the card
+        float glow = glowStrength(entry.getLastActivityMillis(), now);
+        Color glowColor = glow > 0 ? activityColor(entry) : null;
+        if (glowColor != null) {
+            int halo = Theme.px(3);
+            g2.setColor(Theme.withAlpha(glowColor, (int) (glow * 140)));
+            g2.setStroke(new BasicStroke(Theme.px(5)));
+            g2.draw(new RoundRectangle2D.Float(r.x - halo, r.y - halo, r.width + 2 * halo, r.height + 2 * halo, radius + 4, radius + 4));
+            g2.setStroke(new BasicStroke(1f));
+        }
 
         // Fill
-        if (selected) {
-            g2.setColor(selBg);
-        } else if (hovered) {
-            g2.setColor(new Color(selBg.getRed(), selBg.getGreen(), selBg.getBlue(), 40));
-        } else {
-            g2.setColor(cardBg);
+        g2.setColor(selected ? selBg : hovered ? Theme.blend(Theme.surface(), selBg, 0.15f) : Theme.surface());
+        g2.fill(new RoundRectangle2D.Float(r.x, r.y, r.width, r.height, radius, radius));
+        if (glowColor != null && !selected) {
+            g2.setColor(Theme.withAlpha(glowColor, (int) (glow * 45)));
+            g2.fill(new RoundRectangle2D.Float(r.x, r.y, r.width, r.height, radius, radius));
         }
-        g2.fill(new RoundRectangle2D.Float(r.x, r.y, r.width, r.height, 8, 8));
 
-        // Border: breakpoint = orange thick, in-scope = solid, out-of-scope = dashed
+        // Border: breakpoint = accent thick, in-scope = solid, out-of-scope = dashed
         if (entry.isBreakpoint()) {
-            g2.setStroke(new BasicStroke(2.5f));
-            g2.setColor(COLOR_BREAKPOINT);
+            g2.setStroke(new BasicStroke(Theme.px(2) + 0.5f));
+            g2.setColor(Theme.accent());
         } else if (entry.isInScope()) {
             g2.setStroke(new BasicStroke(1f));
-            g2.setColor(COLOR_IN_SCOPE);
+            g2.setColor(showScopeColors() ? Theme.inScope() : Theme.neutralBorder());
         } else {
-            g2.setStroke(new BasicStroke(1f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f, new float[]{4f, 4f}, 0f));
-            g2.setColor(COLOR_OUT_SCOPE);
+            float dash = Theme.px(4);
+            g2.setStroke(new BasicStroke(1f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f, new float[]{dash, dash}, 0f));
+            g2.setColor(Theme.outOfScope());
         }
-        g2.draw(new RoundRectangle2D.Float(r.x, r.y, r.width, r.height, 8, 8));
+        g2.draw(new RoundRectangle2D.Float(r.x, r.y, r.width, r.height, radius, radius));
         g2.setStroke(new BasicStroke(1f));
 
-        // Top right seq number
-        g2.setFont(new Font("SansSerif", Font.BOLD, 10));
-        String seqNum = "#" + (logIdx + 1);
-        int snWidth = g2.getFontMetrics().stringWidth(seqNum);
-        g2.setColor(selected ? new Color(255, 255, 255, 180) : new Color(150, 150, 150, 180));
-        int seqX = r.x + r.width - snWidth - 6;
-        g2.drawString(seqNum, seqX, r.y + 14);
+        Font pathFont = Theme.mono(Font.BOLD, 0);
+        Font infoFont = Theme.font(Font.PLAIN, -3);
+        Font badgeFont = Theme.font(Font.PLAIN, -4);
+        Font seqFont = Theme.font(Font.BOLD, -3);
+        FontMetrics pathFm = g2.getFontMetrics(pathFont);
+        FontMetrics infoFm = g2.getFontMetrics(infoFont);
+        FontMetrics badgeFm = g2.getFontMetrics(badgeFont);
+        int padX = Theme.px(6);
+        int line1 = r.y + Theme.px(4) + pathFm.getAscent();
+        int line2 = line1 + pathFm.getDescent() + infoFm.getAscent();
+        int line3 = line2 + infoFm.getDescent() + badgeFm.getAscent();
+        Color secondary = selected ? Theme.withAlpha(selFg, 200) : Theme.muted();
 
-        // Breakpoint indicator dot
+        // Top right: step / log number
+        g2.setFont(seqFont);
+        int seqX = r.x + r.width - g2.getFontMetrics().stringWidth(label) - padX;
+        g2.setColor(secondary);
+        g2.drawString(label, seqX, line1);
+
+        // Breakpoint dot: solid when set; an empty circle on hover invites a click to set one
+        int dotSize = Theme.px(10);
+        int dotX = seqX - dotSize - Theme.px(4);
+        int dotY = line1 - pathFm.getAscent() / 2 - dotSize / 2;
+        int hit = Theme.px(3);
+        breakpointDotRects.add(new Rectangle(dotX - hit, dotY - hit, dotSize + 2 * hit, dotSize + 2 * hit));
+        boolean dotHovered = entry == hoveredDotEntry;
         if (entry.isBreakpoint()) {
-            g2.setColor(COLOR_BREAKPOINT);
-            g2.fillOval(seqX - 12, r.y + 6, 8, 8);
+            g2.setColor(dotHovered ? Theme.accent().darker() : Theme.accent());
+            g2.fillOval(dotX, dotY, dotSize, dotSize);
+        } else if (hovered || dotHovered) {
+            g2.setColor(dotHovered ? Theme.accent() : secondary);
+            g2.setStroke(new BasicStroke(dotHovered ? 2f : 1.2f));
+            g2.drawOval(dotX, dotY, dotSize, dotSize);
+            g2.setStroke(new BasicStroke(1f));
         }
 
-        // Path text - show last segment(s) so cards are distinguishable
+        // Path: normal text for 2xx (the common case), only redirects and errors are coloured so they
+        // stand out; always leaves room for the breakpoint dot
         Color textPrimary;
-        if (selected) {
-            textPrimary = Color.WHITE;
-        } else if (!entry.isInScope()) {
-            textPrimary = COLOR_OUT_SCOPE;
-        } else if (entry.getStatusCode() >= 400) {
-            textPrimary = COLOR_ERROR;
-        } else if (entry.getStatusCode() >= 300) {
-            textPrimary = COLOR_REDIRECT;
-        } else if (entry.getStatusCode() >= 200) {
-            textPrimary = COLOR_SUCCESS;
-        } else {
-            textPrimary = getForeground();
-        }
-        g2.setFont(new Font("Monospaced", Font.BOLD, 12));
+        if (selected) textPrimary = selFg;
+        else if (!entry.isInScope()) textPrimary = Theme.outOfScope();
+        else if (entry.getStatusCode() >= 400) textPrimary = Theme.error();
+        else if (entry.getStatusCode() >= 300) textPrimary = Theme.redirect();
+        else textPrimary = Theme.foreground();
+        g2.setFont(pathFont);
         g2.setColor(textPrimary);
-        String path = shortenPath(entry.getPath(), 18);
-        g2.drawString(path, r.x + 6, r.y + 18);
+        int pathMaxWidth = dotX - Theme.px(4) - (r.x + padX);
+        String path = cardLabel(entry.getPath(), pathFm, pathMaxWidth);
+        g2.drawString(path, r.x + padX, line1);
 
-        // Keyword Badging
-        if (entry.getMatchedKeywords() != null && !entry.getMatchedKeywords().isEmpty()) {
-            String matchText = String.join(", ", entry.getMatchedKeywords());
-            if (matchText.length() > 20) matchText = matchText.substring(0, 17) + "...";
-            g2.setFont(new Font("SansSerif", Font.BOLD, 9));
-            int tw = g2.getFontMetrics().stringWidth(matchText);
-            
-            g2.setColor(new Color(220, 50, 50));
-            g2.fillRoundRect(r.x + r.width - tw - 8, r.y + 26, tw + 6, 14, 4, 4);
-            g2.setColor(Color.WHITE);
-            g2.drawString(matchText, r.x + r.width - tw - 5, r.y + 36);
-        }
-
-        // Info line: sparkline + hits
-        g2.setFont(new Font("SansSerif", Font.PLAIN, 9));
+        // Status history + hits
         StringBuilder info = new StringBuilder();
         if (entry.getStatusHistory() != null && entry.getStatusHistory().size() > 1) {
-             for (int i = 0; i < entry.getStatusHistory().size(); i++) {
-                 info.append(entry.getStatusHistory().get(i));
-                 if (i < entry.getStatusHistory().size() - 1) info.append(" \u2192 ");
-             }
-             info.append("  ");
+            for (int i = 0; i < entry.getStatusHistory().size(); i++) {
+                info.append(entry.getStatusHistory().get(i));
+                if (i < entry.getStatusHistory().size() - 1) info.append(" \u2192 ");
+            }
+            info.append("  ");
         } else if (entry.getStatusCode() > 0) {
             info.append(entry.getStatusCode()).append("  ");
         }
         info.append("\u00D7").append(entry.getHitCount());
-        Color infoColor = selected ? new Color(200, 200, 200) : (entry.isInScope() ? Color.GRAY : new Color(180, 180, 180));
-        g2.setColor(infoColor);
-        g2.drawString(info.toString(), r.x + 6, r.y + 32);
+        g2.setFont(infoFont);
+        g2.setColor(secondary);
+        g2.drawString(info.toString(), r.x + padX, line2);
 
-        // Type badge (REQ+RES or REQ)
+        // Live-grep keyword badge, right-aligned on the info line
+        if (entry.getMatchedKeywords() != null && !entry.getMatchedKeywords().isEmpty()) {
+            g2.setFont(Theme.font(Font.BOLD, -4));
+            FontMetrics km = g2.getFontMetrics();
+            String matchText = fitText(g2, String.join(", ", entry.getMatchedKeywords()), r.width / 2);
+            int kw = km.stringWidth(matchText) + Theme.px(6);
+            int kh = km.getHeight();
+            int kx = r.x + r.width - kw - padX;
+            int ky = line2 - infoFm.getAscent();
+            g2.setColor(Theme.error());
+            g2.fillRoundRect(kx, ky, kw, kh, Theme.px(4), Theme.px(4));
+            g2.setColor(Color.WHITE);
+            g2.drawString(matchText, kx + Theme.px(3), ky + km.getAscent());
+        }
+
+        // Method and whether a response was seen
         String badge = entry.getResponse() != null ? "REQ+RES" : "REQ";
-        g2.setFont(new Font("SansSerif", Font.PLAIN, 8));
-        g2.setColor(selected ? new Color(180, 180, 180) : (entry.isInScope() ? new Color(100, 100, 100) : new Color(170, 170, 170)));
-        g2.drawString(badge, r.x + 6, r.y + 44);
+        if (entry.getRequest() != null) badge = entry.getRequest().method() + " \u00B7 " + badge;
+        g2.setFont(badgeFont);
+        g2.setColor(secondary);
+        g2.drawString(badge, r.x + padX, line3);
+
+        if (entry.isPaused()) drawPaused(g2, entry, r, now);
     }
 
     @Override
@@ -601,13 +970,18 @@ public class TrafficPlotPanel extends JPanel implements Scrollable {
     @Override
     public boolean getScrollableTracksViewportWidth() {
         if (getParent() instanceof JViewport) {
-            return (((JViewport) getParent()).getWidth() > LANE_HEADER_W + CARD_W + CARD_GAP * 2);
+            return (((JViewport) getParent()).getWidth() > cardW + cardGap * 2);
         }
         return true;
     }
 
     @Override
     public boolean getScrollableTracksViewportHeight() {
+        // Stretch to fill the visible area when the content is shorter, so a click anywhere
+        // below the last row still reaches the graph (and deselects / closes the details)
+        if (getParent() instanceof JViewport) {
+            return ((JViewport) getParent()).getHeight() > getPreferredSize().height;
+        }
         return false;
     }
 }

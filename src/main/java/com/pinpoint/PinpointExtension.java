@@ -8,6 +8,12 @@ import com.pinpoint.proxy.PinContextMenuProvider;
 import com.pinpoint.model.PinManager;
 
 public class PinpointExtension implements BurpExtension {
+    /** The jar's Implementation-Version (from build.gradle), or "dev" when run from classes. */
+    private static String version() {
+        String v = PinpointExtension.class.getPackage().getImplementationVersion();
+        return v != null ? v : "dev";
+    }
+
     @Override
     public void initialize(MontoyaApi api) {
         api.extension().setName("Pinpoint");
@@ -19,6 +25,9 @@ public class PinpointExtension implements BurpExtension {
         api.userInterface().registerSuiteTab("Pinpoint", mainUI.getUiComponent());
         api.userInterface().registerContextMenuItemsProvider(new PinContextMenuProvider(api, pinManager));
         
+        // Keep the graph's in/out-of-scope styling in sync with Burp's Target > Scope
+        api.scope().registerScopeChangeHandler(change -> pinManager.refreshScope());
+
         api.proxy().registerRequestHandler(proxyHandler);
         api.proxy().registerResponseHandler(proxyHandler);
 
@@ -35,9 +44,9 @@ public class PinpointExtension implements BurpExtension {
           / /              /_/   /_/_/ /_/ .___/\\____/_/_/ /_/\\__/                
          /_/                            /_/                                       
         
-        Pinpoint v1.0.0
-        Copyright (c) 2026 Stylianos Mavromatis - MIT License
-        """;
+        Pinpoint v%s
+        Copyright (c) 2026 Stylianos Mavromatis - GNU GPL v3
+        """.formatted(version());
         api.logging().logToOutput(banner);
         api.logging().logToOutput("Pinpoint initialized successfully!");
     }

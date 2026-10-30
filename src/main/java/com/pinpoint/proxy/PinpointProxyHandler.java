@@ -14,6 +14,7 @@ import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction;
 
 import com.pinpoint.model.PendingItem;
 import com.pinpoint.model.PinManager;
+import com.pinpoint.model.TrafficEntry;
 import com.pinpoint.ui.MainUI;
 
 import java.util.concurrent.ExecutionException;
@@ -36,23 +37,28 @@ public class PinpointProxyHandler implements ProxyRequestHandler, ProxyResponseH
 
     @Override
     public ProxyRequestReceivedAction handleRequestReceived(InterceptedRequest request) {
-        boolean isPinned = pinManager.isRequestPinned(request.url());
-        boolean inScope = api.scope().isInScope(request.url());
-        pinManager.logTraffic(String.valueOf(request.messageId()), request.url(), true, isPinned, request, null, inScope);
+        String url = request.url();
+        boolean inScope = api.scope().isInScope(url);
+        boolean byBreakpoint = pinManager.isRequestPinned(url);
+        boolean byStep = pinManager.shouldStepHold(url, inScope);
+        boolean held = byBreakpoint || byStep;
+        TrafficEntry entry = pinManager.logTraffic(url, true, request, null, inScope, held);
 
-        if (!isPinned) {
+        if (!held) {
             return ProxyRequestReceivedAction.continueWith(request);
         }
 
-        api.logging().logToOutput("Pinpoint matching request: " + request.url());
+        api.logging().logToOutput("Pinpoint holding request: " + url);
 
-        PendingItem pendingItem = new PendingItem(String.valueOf(request.messageId()), request);
+        PendingItem pendingItem = new PendingItem(request, entry, byBreakpoint, byStep, inScope);
+        pinManager.setPaused(entry, true, true);
         mainUI.addPendingItem(pendingItem);
 
         try {
             HttpRequest editedRequest = pendingItem.getRequestFuture()
                     .get(INTERCEPT_TIMEOUT_MINUTES, TimeUnit.MINUTES);
             if (editedRequest != null) {
+                pinManager.markReleased(entry, true);
                 return ProxyRequestReceivedAction.continueWith(editedRequest, request.annotations());
             } else {
                 return ProxyRequestReceivedAction.drop();
@@ -60,6 +66,7 @@ public class PinpointProxyHandler implements ProxyRequestHandler, ProxyResponseH
         } catch (TimeoutException e) {
             api.logging().logToError("Pinpoint: Request intercept timed out after " + INTERCEPT_TIMEOUT_MINUTES + " min, forwarding original.");
             mainUI.removePendingItem(pendingItem);
+            pinManager.markReleased(entry, true);
             return ProxyRequestReceivedAction.continueWith(request);
         } catch (InterruptedException | ExecutionException e) {
             if (e instanceof InterruptedException) {
@@ -67,7 +74,10 @@ public class PinpointProxyHandler implements ProxyRequestHandler, ProxyResponseH
             }
             api.logging().logToError("Pinpoint: Request wait interrupted, discarding edit.");
             mainUI.removePendingItem(pendingItem);
+            pinManager.markReleased(entry, true);
             return ProxyRequestReceivedAction.continueWith(request);
+        } finally {
+            pinManager.setPaused(entry, true, false);
         }
     }
 
@@ -78,28 +88,29 @@ public class PinpointProxyHandler implements ProxyRequestHandler, ProxyResponseH
 
     @Override
     public ProxyResponseReceivedAction handleResponseReceived(InterceptedResponse response) {
-        boolean isPinned = false;
-        String url = "-";
-        if (response.initiatingRequest() != null) {
-            url = response.initiatingRequest().url();
-            isPinned = pinManager.isResponsePinned(url);
-        }
-        boolean inScope2 = api.scope().isInScope(url);
-        pinManager.logTraffic(String.valueOf(response.messageId()), url, false, isPinned, response.initiatingRequest(), response, inScope2);
+        HttpRequest initiating = response.initiatingRequest();
+        String url = initiating != null ? initiating.url() : "-";
+        boolean inScope = api.scope().isInScope(url);
+        boolean byBreakpoint = initiating != null && pinManager.isResponsePinned(url);
+        boolean byStep = initiating != null && pinManager.shouldStepHold(url, inScope);
+        boolean held = byBreakpoint || byStep;
+        TrafficEntry entry = pinManager.logTraffic(url, false, initiating, response, inScope, held);
 
-        if (!isPinned) {
+        if (!held) {
             return ProxyResponseReceivedAction.continueWith(response);
         }
 
-        api.logging().logToOutput("Pinpoint matching response: " + response.initiatingRequest().url());
-        
-        PendingItem pendingItem = new PendingItem(String.valueOf(response.messageId()), response.initiatingRequest(), response);
+        api.logging().logToOutput("Pinpoint holding response: " + url);
+
+        PendingItem pendingItem = new PendingItem(initiating, response, entry, byBreakpoint, byStep, inScope);
+        pinManager.setPaused(entry, false, true);
         mainUI.addPendingItem(pendingItem);
 
         try {
             HttpResponse editedResponse = pendingItem.getResponseFuture()
                     .get(INTERCEPT_TIMEOUT_MINUTES, TimeUnit.MINUTES);
             if (editedResponse != null) {
+                pinManager.markReleased(entry, false);
                 return ProxyResponseReceivedAction.continueWith(editedResponse, response.annotations());
             } else {
                 return ProxyResponseReceivedAction.drop();
@@ -107,6 +118,7 @@ public class PinpointProxyHandler implements ProxyRequestHandler, ProxyResponseH
         } catch (TimeoutException e) {
             api.logging().logToError("Pinpoint: Response intercept timed out after " + INTERCEPT_TIMEOUT_MINUTES + " min, forwarding original.");
             mainUI.removePendingItem(pendingItem);
+            pinManager.markReleased(entry, false);
             return ProxyResponseReceivedAction.continueWith(response);
         } catch (InterruptedException | ExecutionException e) {
             if (e instanceof InterruptedException) {
@@ -114,7 +126,10 @@ public class PinpointProxyHandler implements ProxyRequestHandler, ProxyResponseH
             }
             api.logging().logToError("Pinpoint: Response wait interrupted, discarding edit.");
             mainUI.removePendingItem(pendingItem);
+            pinManager.markReleased(entry, false);
             return ProxyResponseReceivedAction.continueWith(response);
+        } finally {
+            pinManager.setPaused(entry, false, false);
         }
     }
 

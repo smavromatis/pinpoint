@@ -9,32 +9,23 @@ import java.awt.*;
 
 public class MainUI {
 
-    private final MontoyaApi api;
-    private final PinManager pinManager;
     private final JPanel mainPanel;
-    
+
     private final InterceptPanel interceptPanel;
     private final PinsPanel pinsPanel;
-    private final JTabbedPane tabbedPane;
 
     public MainUI(MontoyaApi api, PinManager pinManager) {
-        this.api = api;
-        this.pinManager = pinManager;
-
         this.mainPanel = new JPanel(new BorderLayout());
-        this.tabbedPane = new JTabbedPane();
 
+        // Single view: held messages are edited in the flow view's bottom area
         this.interceptPanel = new InterceptPanel(api, pinManager);
-        this.pinsPanel = new PinsPanel(api, pinManager);
+        this.pinsPanel = new PinsPanel(api, pinManager, interceptPanel);
 
-        tabbedPane.addTab("Intercept Queue", interceptPanel.getPanel());
-        tabbedPane.addTab("BreakPoint Flow", pinsPanel.getPanel());
-
-        mainPanel.add(tabbedPane, BorderLayout.CENTER);
+        mainPanel.add(pinsPanel.getPanel(), BorderLayout.CENTER);
 
         pinManager.addListener(() -> {
             SwingUtilities.invokeLater(() -> {
-                boolean on = pinManager.isInterceptEnabled();
+                boolean on = pinManager.isInterceptEnabled() || pinManager.isStepMode();
                 updateSuiteTabTitle(on);
             });
         });
@@ -48,7 +39,7 @@ public class MainUI {
                 for (int i = 0; i < burpTabs.getTabCount(); i++) {
                     Component tab = burpTabs.getComponentAt(i);
                     if (tab == mainPanel) {
-                        burpTabs.setTitleAt(i, interceptOn ? "\u25CF Pinpoint" : "Pinpoint");
+                        burpTabs.setTitleAt(i, interceptOn ? "● Pinpoint" : "Pinpoint");
                         return;
                     }
                 }
@@ -70,6 +61,8 @@ public class MainUI {
     }
 
     public void shutdown() {
+        // Unblock proxy threads still waiting on held messages before the extension goes away
+        interceptPanel.releaseAllOriginal();
         pinsPanel.shutdown();
     }
 }
